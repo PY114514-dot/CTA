@@ -1,0 +1,36 @@
+# Python build and runtime files
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+Python/
+
+# Node build and dependency files
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Local runtime data
+data/
+.env
+
+# Machine-generated or accidental local directories
+%SystemDrive%/
+.codex/
+
+# Local experiments and cloned reference repositories
+tmp/
+QVerisFlow/
+Vibe-Trading/
+
+# Debug output must be written outside source directories
+*.log
+backend/debug_*.png
+backend/test_crop*.png
+backend/crash_tail.txt
+backend/err500.txt
+backend/scripts/validation_out/
+
+# Local research samples (large and potentially confidential)
+分类结果*/
+test/

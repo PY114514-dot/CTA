@@ -1,0 +1,274 @@
+/* ==========================================================================
+   Serif editorial design system — global styles
+   Complements the Ant Design v5 theme in theme.ts with typographic and
+   editorial details that design tokens cannot express.
+   ========================================================================== */
+
+:root {
+  --serif-background: #fafaf8;
+  --serif-foreground: #1a1a1a;
+  --serif-muted: #f5f3f0;
+  --serif-muted-foreground: #6b6b6b;
+  --serif-accent: #b8860b;
+  --serif-accent-secondary: #d4a84b;
+  --serif-border: #e8e4df;
+  --serif-card: #ffffff;
+  --font-display: "Source Sans 3", "PingFang SC", "Microsoft YaHei", "Helvetica Neue", system-ui, sans-serif;
+  --font-body: "Source Sans 3", "PingFang SC", "Microsoft YaHei", "Helvetica Neue", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", "PingFang SC", "Microsoft YaHei", "SFMono-Regular", Consolas, monospace;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--serif-background);
+  color: var(--serif-foreground);
+  font-family: var(--font-body);
+  letter-spacing: 0;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* --------------------------------------------------------------------------
+   Paper texture overlay — a subtle tactile quality across the whole page.
+   Uses an inline SVG noise at very low opacity so it never competes with
+   content.
+   -------------------------------------------------------------------------- */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+  opacity: 0.03;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* Keep headings, cards and controls on one UI family.  Chinese serif fallback
+   has a different ascent/descent from the form font and causes baseline drift. */
+h1, h2, h3, h4, h5,
+.ant-typography h1,
+.ant-typography h2,
+.ant-typography h3,
+.ant-typography h4,
+.ant-typography h5 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: 0;
+  color: var(--serif-foreground);
+}
+
+.ant-card-head-title {
+  font-family: var(--font-display);
+  font-weight: 500;
+  line-height: 24px;
+  letter-spacing: 0;
+}
+
+/* Statistic numbers are large display figures. Playfair Display's digits are
+   proportionally spaced and it ships no `tnum` (tabular figures) feature, so
+   metric values like the Sharpe ratio would not align column-wise. Use the
+   body sans (Source Sans 3 — tabular digits by default) with an explicit
+   tabular-nums so financial figures line up evenly. */
+.ant-statistic-content,
+.ant-statistic-content-value,
+.ant-statistic-content-suffix,
+.ant-statistic-content-prefix {
+  font-family: var(--font-body);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+.ant-statistic-title {
+  font-family: var(--font-body);
+  font-size: 0.78rem;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--serif-muted-foreground);
+}
+
+/* --------------------------------------------------------------------------
+   Small caps labels — tracked uppercase monospace for section labels and
+   meta information. A defining editorial element.
+   -------------------------------------------------------------------------- */
+.small-caps {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--serif-accent);
+}
+
+.small-caps-muted {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--serif-muted-foreground);
+}
+
+/* --------------------------------------------------------------------------
+   Section label with flanking rules — the editorial divider pattern.
+   -------------------------------------------------------------------------- */
+.section-label {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 8px 0 20px;
+}
+.section-label::before,
+.section-label::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--serif-border);
+}
+.section-label > span {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--serif-accent);
+  white-space: nowrap;
+}
+
+/* --------------------------------------------------------------------------
+   Card accent top border — a thin gold rule crowning featured cards.
+   -------------------------------------------------------------------------- */
+.card-accent-top {
+  border-top: 2px solid var(--serif-accent) !important;
+}
+
+/* Subtle lift on card hover — shadow deepens, no translate. */
+.card-hover {
+  transition: box-shadow 0.2s ease-out, border-color 0.2s ease-out;
+}
+.card-hover:hover {
+  box-shadow: 0 4px 12px rgba(26, 26, 26, 0.06);
+  border-color: var(--serif-border);
+}
+
+/* --------------------------------------------------------------------------
+   Ant Design refinements that tokens cannot express.
+   -------------------------------------------------------------------------- */
+
+/* Card head gets a warm hairline rather than the default divider weight. */
+.ant-card-head {
+  border-bottom: 1px solid var(--serif-border);
+  min-height: 56px;
+}
+
+/* Softer card border by default. */
+.ant-card {
+  border: 1px solid var(--serif-border);
+}
+
+/* Buttons: refined tracking on primary labels. */
+.ant-btn-primary {
+  letter-spacing: 0.03em;
+}
+
+/* Ghost/underline link style for tertiary actions. */
+.ant-btn-link {
+  text-underline-offset: 4px;
+}
+
+/* Table labels and form controls share the same baseline and weight. */
+.ant-table-thead > tr > th {
+  font-family: var(--font-body);
+  font-size: 0.78rem;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.ant-btn,
+.ant-input,
+.ant-input-affix-wrapper,
+.ant-select,
+.ant-picker,
+.ant-tag,
+.ant-typography,
+.ant-descriptions,
+.ant-table {
+  font-family: var(--font-body);
+}
+
+.ant-btn,
+.ant-input,
+.ant-select-selection-item,
+.ant-picker-input > input {
+  font-weight: 400;
+}
+
+.ant-btn > span,
+.ant-select-selection-item,
+.ant-picker-input > input,
+.ant-input {
+  line-height: 1.5;
+}
+
+/* Drawer title in serif. */
+.ant-drawer-title {
+  font-family: var(--font-display);
+  font-weight: 600;
+}
+
+/* Modal title in serif. */
+.ant-modal-title {
+  font-family: var(--font-display);
+  font-weight: 600;
+}
+
+/* Steps: serif step titles for editorial consistency. */
+.ant-steps-item-title {
+  font-family: var(--font-body);
+}
+
+/* Tag: slightly refined. */
+.ant-tag {
+  letter-spacing: 0.02em;
+}
+
+/* --------------------------------------------------------------------------
+   Editorial header (masthead)
+   -------------------------------------------------------------------------- */
+.masthead-subtitle {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 500;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--serif-accent-secondary);
+}
+
+/* --------------------------------------------------------------------------
+   Focus & accessibility
+   -------------------------------------------------------------------------- */
+a:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--serif-accent);
+  outline-offset: 2px;
+}
+
+/* Respect reduced motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  html {
+    scroll-behavior: auto;
+  }
+}
