@@ -2,6 +2,19 @@ import { Alert, Button, Checkbox, Col, Divider, Input, Row, Typography } from "a
 
 const { Paragraph, Text } = Typography;
 
+const CHART_REVIEW_REASON_LABELS: Record<string, string> = {
+  trace_unreliable: "曲线连续性或覆盖率未通过质量门",
+  y_axis_unverified: "纵轴刻度尚未完成校准",
+  x_axis_unverified: "横轴日期尚未完成校准",
+  review_required: "后端未确认自动采用条件",
+  candidate_pending_review: "已有候选净值尚未完成人工确认",
+  manual_digitization_candidate: "手动数字化结果仅是候选值",
+};
+
+function chartReviewReasonLabel(reason: string): string {
+  return CHART_REVIEW_REASON_LABELS[reason] ?? reason;
+}
+
 /** Direct NAV-table import and the final human-review gate before research. */
 export default function NavImportReviewPanel({
   navText,
@@ -9,6 +22,9 @@ export default function NavImportReviewPanel({
   conflictReasons,
   conflictConfirmed,
   onConflictConfirmedChange,
+  chartReviewReasons,
+  chartReviewConfirmed,
+  onChartReviewConfirmedChange,
   isCalibrating,
   isSaving,
   isAnalyzing,
@@ -24,6 +40,9 @@ export default function NavImportReviewPanel({
   conflictReasons: string[];
   conflictConfirmed: boolean;
   onConflictConfirmedChange: (value: boolean) => void;
+  chartReviewReasons: string[];
+  chartReviewConfirmed: boolean;
+  onChartReviewConfirmedChange: (value: boolean) => void;
   isCalibrating: boolean;
   isSaving: boolean;
   isAnalyzing: boolean;
@@ -50,14 +69,28 @@ export default function NavImportReviewPanel({
           description={<><div>{conflictReasons.join("；")}</div><Checkbox checked={conflictConfirmed} onChange={(event) => onConflictConfirmedChange(event.target.checked)} style={{ marginTop: 8 }}>我已在原图核对关键点，并确认当前净值为人工复核版本</Checkbox></>}
         />
       )}
+      {chartReviewReasons.length > 0 && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginTop: 12 }}
+          message="图表识别结果仍是候选，不能自动采用"
+          description={<>
+            <div>{chartReviewReasons.map(chartReviewReasonLabel).join("；")}</div>
+            <Checkbox checked={chartReviewConfirmed} onChange={(event) => onChartReviewConfirmedChange(event.target.checked)} style={{ marginTop: 8 }}>
+              我已对照原图完成曲线、坐标和日期校准，确认当前净值可用于研究
+            </Checkbox>
+          </>}
+        />
+      )}
       <Row gutter={12} style={{ marginTop: 16 }}>
-        {isCalibrating && <Col xs={24} sm={12}><Button block type="primary" loading={isSaving} disabled={!canAnalyze || isSaving} onClick={onSaveReviewed}>确认并用于研究</Button></Col>}
-        <Col xs={24} sm={isCalibrating ? 12 : 24}><Button block onClick={onAnalyze} loading={isAnalyzing}>计算</Button></Col>
+        {isCalibrating && <Col xs={24} sm={12}><Button block type="primary" loading={isSaving} disabled={!canAnalyze || isSaving || (chartReviewReasons.length > 0 && !chartReviewConfirmed)} onClick={onSaveReviewed}>确认并用于研究</Button></Col>}
+        <Col xs={24} sm={isCalibrating ? 12 : 24}><Button block onClick={onAnalyze} loading={isAnalyzing} disabled={!canAnalyze || (chartReviewReasons.length > 0 && !chartReviewConfirmed)}>计算</Button></Col>
       </Row>
       {analysisError && <Alert type="error" showIcon message={analysisError} style={{ marginTop: 12 }} closable onClose={onDismissAnalysisError} />}
-      {isCalibrating && <Text type="secondary" style={{ display: "block", fontSize: 12, marginTop: 10, lineHeight: 1.55 }}>确认后会以当前曲线写入已复核净值，并自动计算最大回撤后进入研究。候选曲线只供比对；存在披露冲突时，必须先在原图上复核并明确确认。</Text>}
+      {isCalibrating && <Text type="secondary" style={{ display: "block", fontSize: 12, marginTop: 10, lineHeight: 1.55 }}>确认后会以当前曲线写入已复核净值，并自动计算最大回撤后进入研究。候选曲线只供比对；存在披露冲突或图表质量门未通过时，必须先在原图上复核并明确确认。</Text>}
       <Paragraph type="secondary" style={{ marginTop: 16, marginBottom: 0 }}>
-        当前共 <Text strong>{navCount}</Text> 个净值点。{!canAnalyze && <Text type="warning"> 至少需要 2 条记录才能计算。</Text>}<br />
+        当前共 <Text strong>{navCount}</Text> 个净值点。{!canAnalyze && <Text type="warning"> 至少需要 2 条记录才能计算。</Text>}{chartReviewReasons.length > 0 && !chartReviewConfirmed && <Text type="warning"> 请先完成图表人工复核。</Text>}<br />
         <Text type="secondary">提示：在净值框中按 Ctrl + Enter 可快速计算。</Text>
       </Paragraph>
     </>

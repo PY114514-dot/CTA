@@ -406,7 +406,6 @@ def detect_plot_area(
 class TraceConfig:
     """Configuration for curve tracing."""
 
-    min_column_gap: int = 1  # max consecutive empty columns before stopping a segment
     vertical_merge_px: int = 3  # merge Y values within this distance in a column
     min_points: int = 5  # minimum traced points to consider a curve valid
     dilate_px: int = 1  # dilate mask to connect anti-aliased pixels
@@ -427,9 +426,9 @@ def trace_curve(
 ) -> list[TracedPoint]:
     """Trace a single curve within the plot area.
 
-    Uses continuity-constrained column scanning: each column selects the
-    Y cluster closest to the previous column's position (within max_slope_px),
-    preventing "track jumping" at curve crossings.
+    Uses a full-width continuity-constrained path search.  Competing Y
+    clusters remain alive until the scan completes, so a same-colour legend or
+    annotation cannot win merely because it appears first.
 
     Returns raw pixel points with sub-pixel Y accuracy (calibration to
     values happens separately).
@@ -459,48 +458,44 @@ def trace_curve(
     mask = mask & region_mask
     mask = _suppress_bottom_legend_components(mask, plot_area, config)
 
-    points: list[TracedPoint] = []
-    last_y: float | None = None  # continuity tracker
-    empty_streak = 0
-
+    # Keep competing trajectories until the whole image has been scanned.
+    # Choosing a single cluster in the first column is brittle: a same-colour
+    # annotation can sit nearer the plot centre than the real curve.  The
+    # longest smooth path is identifiable only with full-width evidence.
+    frontier: list[tuple[int, float, int, float, tuple | None]] = []
     for x in range(plot_area.left, plot_area.right):
         col = mask[:, x]
         ys = np.where(col > 0)[0]
-
         if len(ys) == 0:
-            empty_streak += 1
-            # Preserve the prior trajectory across a gap.  Resetting it makes
-            # a same-colour legend swatch look like a legitimate new curve.
             continue
-
-        empty_streak = 0
-
-        # Merge nearby Y values (curve thickness), take cluster centers
         clusters = _cluster_values(ys, config.vertical_merge_px)
+        next_frontier = []
+        for y_center in clusters:
+            predecessors = [node for node in frontier if config.max_slope_px <= 0 or abs(node[1] - y_center) <= config.max_slope_px]
+            predecessor = max(
+                predecessors,
+                key=lambda node: (node[2], -(node[3] + abs(node[1] - y_center) ** 2)),
+                default=None,
+            )
+            length = predecessor[2] + 1 if predecessor else 1
+            delta = abs(predecessor[1] - y_center) if predecessor else 0.0
+            roughness = predecessor[3] + delta * delta if predecessor else 0.0
+            next_frontier.append((x, y_center, length, roughness, predecessor))
+        frontier = next_frontier
 
-        if last_y is not None and config.max_slope_px > 0:
-            # Continuity constraint: pick the cluster closest to last_y
-            # within the allowed slope
-            max_dy = config.max_slope_px
-            candidates = [c for c in clusters if abs(c - last_y) <= max_dy]
-            if candidates:
-                # Choose the closest one
-                y_center = min(candidates, key=lambda c: abs(c - last_y))
-            else:
-                # Do not jump to a distant same-colour component (typically a
-                # legend, title or annotation).  Leave a trace gap instead.
-                empty_streak += 1
-                continue
-        else:
-            # No prior position: take the largest cluster (most pixels)
-            # or the one nearest to vertical center of plot
-            if len(clusters) == 1:
-                y_center = clusters[0]
-            else:
-                mid = (plot_area.top + plot_area.bottom) / 2
-                y_center = min(clusters, key=lambda c: abs(c - mid))
+    if not frontier:
+        return []
 
-        # Sub-pixel refinement: weighted centroid of mask pixels near y_center
+    node = max(frontier, key=lambda item: (item[2], -item[3]))
+    path: list[tuple[int, float]] = []
+    while node is not None:
+        path.append((node[0], node[1]))
+        node = node[4]
+    path.reverse()
+
+    points: list[TracedPoint] = []
+    for x, y_center in path:
+        col = mask[:, x]
         y_int = int(round(y_center))
         y_lo = max(0, y_int - config.vertical_merge_px)
         y_hi = min(mask.shape[0], y_int + config.vertical_merge_px + 1)
@@ -510,9 +505,7 @@ def trace_curve(
             y_subpixel = float(np.average(local_ys, weights=local_weights))
         else:
             y_subpixel = y_center
-
         points.append(TracedPoint(x_px=x, y_px=int(round(y_subpixel))))
-        last_y = y_subpixel
 
     return points
 

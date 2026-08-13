@@ -457,14 +457,28 @@ interface ResultReviewProps {
   /** Image src to overlay traced curves on (optional). */
   imageSrc?: string;
   baseName: string;
-  onApplyToWorkspace: (navText: string) => void;
+  onApplyToWorkspace: (navText: string, reviewConfirmed: boolean) => void;
 }
+
+const CHART_REVIEW_REASON_LABELS: Record<string, string> = {
+  trace_unreliable: "曲线连续性或覆盖率未通过质量门",
+  y_axis_unverified: "纵轴刻度尚未完成校准",
+  x_axis_unverified: "横轴日期尚未完成校准",
+  review_required: "后端未确认自动采用条件",
+  manual_digitization_candidate: "图像识别结果仅是候选值",
+};
 
 /** Shows traced curves, per-curve stats, a data table and export actions. */
 function ResultReview({ result, imageSrc, baseName, onApplyToWorkspace }: ResultReviewProps): React.JSX.Element {
   const [selectedCurve, setSelectedCurve] = useState<string>("");
   const [adjustMode, setAdjustMode] = useState(false);
   const [overlayAdjustment, setOverlayAdjustment] = useState<[number, number]>([0, 0]);
+  const [reviewConfirmed, setReviewConfirmed] = useState(false);
+  const requiresReview = result.review_required !== false;
+  const reviewReasons = requiresReview
+    ? (result.review_reasons?.length ? result.review_reasons : ["review_required"])
+    : [];
+  useEffect(() => setReviewConfirmed(false), [result]);
 
   const curveSeries = useMemo(
     () =>
@@ -533,8 +547,8 @@ function ResultReview({ result, imageSrc, baseName, onApplyToWorkspace }: Result
       const date = titleYear && /^\d{2}-\d{2}$/.test(p.date) ? `${titleYear}-${p.date}` : p.date;
       return `${date},${p.value.toFixed(6)}`;
     }).join("\n");
-    onApplyToWorkspace(text);
-  }, [active, activeAdjustedSeries, onApplyToWorkspace, result.structure?.chart_title]);
+    onApplyToWorkspace(text, !requiresReview || reviewConfirmed);
+  }, [active, activeAdjustedSeries, onApplyToWorkspace, requiresReview, result.structure?.chart_title, reviewConfirmed]);
 
   if (result.error && result.curves.length === 0) {
     return <Alert type="warning" showIcon message={result.error} />;
@@ -571,6 +585,21 @@ function ResultReview({ result, imageSrc, baseName, onApplyToWorkspace }: Result
             { key: "conf", label: "置信度", children: (result.confidence * 100).toFixed(0) + "%" },
             { key: "src", label: "结构来源", children: result.structure?.source === "manual" ? "手动" : "VLM" },
           ]}
+        />
+      )}
+
+      {requiresReview && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginTop: 14 }}
+          message="当前结果只能作为候选，不能自动采用"
+          description={<>
+            <div>{reviewReasons.map((reason) => CHART_REVIEW_REASON_LABELS[reason] ?? reason).join("；")}</div>
+            <Checkbox checked={reviewConfirmed} onChange={(event) => setReviewConfirmed(event.target.checked)} style={{ marginTop: 8 }}>
+              我已对照原图完成曲线、坐标和日期校准，确认当前曲线可用于研究
+            </Checkbox>
+          </>}
         />
       )}
 
@@ -646,7 +675,7 @@ function ResultReview({ result, imageSrc, baseName, onApplyToWorkspace }: Result
         <Button onClick={() => void handleExportXlsx()}>导出 XLSX</Button>
         <Button onClick={() => void handleCopy()} disabled={!active}>复制日期,数值</Button>
         <Tooltip title="将当前曲线写入主工作区净值文本框，核验后再计算">
-          <Button type="primary" onClick={handleApply} disabled={!active}>填入主工作区</Button>
+          <Button type="primary" onClick={handleApply} disabled={!active || (requiresReview && !reviewConfirmed)}>填入主工作区</Button>
         </Tooltip>
       </Space>
       <Paragraph type="secondary" style={{ fontSize: 12, marginTop: 8, marginBottom: 0 }}>
@@ -664,7 +693,7 @@ interface ChartExtractDrawerProps {
   open: boolean;
   onClose: () => void;
   /** Write an extracted "date,value" series into the main workspace textarea. */
-  onApplyToWorkspace: (navText: string) => void;
+  onApplyToWorkspace: (navText: string, reviewConfirmed: boolean) => void;
 }
 
 type StepKey = "upload" | "configure" | "results";
@@ -1150,8 +1179,8 @@ export default function ChartExtractDrawer({
                 result={result}
                 imageSrc={imageUrl}
                 baseName={imageFile.name.replace(/\.[^.]+$/, "")}
-                onApplyToWorkspace={(text) => {
-                  onApplyToWorkspace(text);
+                onApplyToWorkspace={(text, confirmed) => {
+                  onApplyToWorkspace(text, confirmed);
                   onClose();
                 }}
               />
@@ -1233,8 +1262,8 @@ export default function ChartExtractDrawer({
                                 region.region_index,
                               )}
                               baseName={`${pdfName.replace(/\.[^.]+$/, "")}_p${region.page_index + 1}r${region.region_index + 1}`}
-                              onApplyToWorkspace={(text) => {
-                                onApplyToWorkspace(text);
+                              onApplyToWorkspace={(text, confirmed) => {
+                                onApplyToWorkspace(text, confirmed);
                                 onClose();
                               }}
                             />

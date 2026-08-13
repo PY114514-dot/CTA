@@ -135,7 +135,13 @@ def ingest_uploaded_material(
                 rows = _ingest_office_document(session, file_id, content, filename, suffix)
                 audit = {"configured": False, "attempted": False, "succeeded": False, "methods": ["DOCX/PPTX XML 提取"], "nav_rows": rows}
             elif mime_type == "application/pdf" or suffix == ".pdf":
-                audit = _ingest_pdf(session, file_id, content, filename)
+                audit = _ingest_pdf(
+                    session,
+                    file_id,
+                    content,
+                    filename,
+                    product_name_hint=product_name_hint,
+                )
             else:
                 raise ValueError("暂不支持该文件类型的自动解析；请上传 PDF、图片、XLSX、CSV、DOCX 或 PPTX")
         except Exception as error:  # Background jobs must surface a concise, user-visible status.
@@ -273,10 +279,11 @@ def _ingest_report_image(
     # Prefer an existing filename candidate for a one-product report so a
     # later OCR title such as "低波CTA" enriches the same product instead of
     # creating a second, disconnected product record.
+    multi_product_material = _is_multi_product_material(filename, product_name_hint)
     manifest_name = _normalise_manifest_product_name(product_name_hint)
     filename_name = manifest_name or _product_name_from_filename(filename)
     filename_product = None
-    if filename_name:
+    if filename_name and not multi_product_material:
         filename_product = _find_or_create_product(
             session,
             filename_name,
@@ -295,7 +302,7 @@ def _ingest_report_image(
         # unbound until the user selects the concrete product.  This prevents
         # one factsheet from producing both a strategy pseudo-product and its
         # actual product.
-        identity_name = (report.product_identity.product_name or "").strip()
+        identity_name = "" if multi_product_material else (report.product_identity.product_name or "").strip()
         fallback_name = identity_name if _looks_like_product_name(identity_name) else ""
         if fallback_product is None and fallback_name:
             fallback_product = _find_or_create_product(
@@ -309,10 +316,10 @@ def _ingest_report_image(
     # Cheap, explicit routing before the costly pixel trace.  A multi-product
     # page must go through curve binding; a page without a product identity is
     # retained as material evidence rather than spending time guessing a line.
-    if len(report.disclosed_metrics) > 1:
+    if multi_product_material or len(report.disclosed_metrics) > 1:
         material_lane = "multi_product"
         trace_allowed = False
-        triage_reason = "识别到多个产品指标，需先确认曲线与产品归属"
+        triage_reason = "文件标记为多产品资料，需先确认曲线与产品归属"
     elif fallback_product is None:
         material_lane = "non_product_or_unbound"
         trace_allowed = False
@@ -352,7 +359,14 @@ def _ingest_report_image(
         # A one-product image whose filename carries a concrete product name
         # has stronger identity evidence than OCR of labels such as “单位” or
         # “累计”.  Do not create a product from that noisy label.
-        if len(report.disclosed_metrics) == 1:
+        if multi_product_material:
+            # A page-level multi-product hint is not enough to bind its only
+            # OCR row to one fund; wait for explicit product/curve evidence.
+            product = None if len(report.disclosed_metrics) == 1 else _find_or_create_product(
+                session, name, metric.strategy, metric.start_date, metric.end_date,
+                report.product_identity.manager_name,
+            )
+        elif len(report.disclosed_metrics) == 1:
             product = filename_product
             if product is None and _looks_like_product_name(name):
                 product = _find_or_create_product(
@@ -405,7 +419,9 @@ def _ingest_report_image(
         ordered_products = [fallback_product]
     for curve in report.product_curve_candidates:
         product = products_by_source_id.get(curve.product_id or "")
-        curve_is_bound = product is not None or len(report.disclosed_metrics) == 1
+        curve_is_bound = product is not None or (
+            len(report.disclosed_metrics) == 1 and not multi_product_material
+        )
         store.add_fragment(
             session,
             file_id=file_id,
@@ -434,7 +450,7 @@ def _ingest_report_image(
             session, file_id, content, report.product_curve_candidates,
             ordered_products, filename, report.disclosed_metrics,
         )
-    elif not report.disclosed_metrics and fallback_product is not None:
+    elif not report.disclosed_metrics and fallback_product is not None and trace_allowed:
         # No table, no candidates — treat the whole image as one NAV chart.
         trace_audits = [_trace_whole_image(session, file_id, content, fallback_product.standard_name if fallback_product else (Path(filename).stem if filename else "未命名产品"))]
     # A few red/green table cells can be mistaken for a short chart trace.
@@ -446,7 +462,7 @@ def _ingest_report_image(
             NavCandidateVersion.confidence >= 0.65,
         )
     ).scalar() is not None
-    if not has_reliable_candidate and fallback_product is not None:
+    if trace_allowed and not has_reliable_candidate and fallback_product is not None:
         recovery_points, recovery_audit = _recover_disclosed_nav_table(content)
         trace_audits.append(recovery_audit)
         recovery_method = "VLM 披露净值表读取"
@@ -654,10 +670,7 @@ def _recover_monthly_nav_from_return_table(image_bytes: bytes) -> tuple[list[dic
         audit.update({"attempted": True, "calls": 1})
         raw = _run_async(provider.extract_structure(image_bytes, _MONTHLY_RETURN_TABLE_PROMPT))
         rows, annual_returns, latest_nav = _parse_monthly_return_payload(raw)
-        rows, repairs = _repair_shifted_week_return(rows, annual_returns)
         audit.update({"succeeded": True, "successful_calls": 1, "row_count": len(rows)})
-        if repairs:
-            audit["repairs"] = repairs
     except Exception as exc:
         audit.update({"attempted": True, "failed_calls": 1, "errors": [str(exc)[:300]]})
         return [], audit
@@ -699,32 +712,6 @@ def _recover_monthly_nav_from_return_table(image_bytes: bytes) -> tuple[list[dic
         })
         return [], audit
     return _valid_nav_points(points), audit
-
-
-def _repair_shifted_week_return(
-    rows: list[tuple[int, int, float]],
-    annual_returns: dict[int, float],
-) -> tuple[list[tuple[int, int, float]], list[str]]:
-    """Repair a leading weekly-return cell only when annual totals prove it."""
-    repaired = list(rows)
-    notes: list[str] = []
-    for year, reported in annual_returns.items():
-        year_rows = [row for row in repaired if row[0] == year]
-        if len(year_rows) < 2 or year_rows[0][1] != 1:
-            continue
-        original = float(np.prod([1 + value for _, _, value in year_rows]) - 1)
-        if abs(original - reported) <= 0.012:
-            continue
-        shifted = [(row_year, month - 1, value) for row_year, month, value in year_rows[1:]]
-        shifted_compound = float(np.prod([1 + value for _, _, value in shifted]) - 1)
-        if abs(shifted_compound - reported) > 0.012:
-            continue
-        repaired = [row for row in repaired if row[0] != year] + shifted
-        repaired.sort(key=lambda row: (row[0], row[1]))
-        notes.append(
-            f"{year} 年首项按周收益列剔除，其余月份左移；复利 {shifted_compound:.2%} 与披露合计 {reported:.2%} 一致"
-        )
-    return repaired, notes
 
 
 def _parse_monthly_return_rows(raw: str) -> list[tuple[int, int, float]]:
@@ -1647,7 +1634,13 @@ def _extract_office_parts(content: bytes, suffix: str) -> list[dict[str, Any]]:
     return parts
 
 
-def _ingest_pdf(session: Any, file_id: str, content: bytes, filename: str) -> dict[str, Any]:
+def _ingest_pdf(
+    session: Any,
+    file_id: str,
+    content: bytes,
+    filename: str,
+    product_name_hint: str | None = None,
+) -> dict[str, Any]:
     stem = Path(filename).stem
 
     # Phase 1: text layer for context.
@@ -1668,89 +1661,104 @@ def _ingest_pdf(session: Any, file_id: str, content: bytes, filename: str) -> di
             product_id=None,
         )
 
-    # Phase 2: chart pipeline for NAV curves.
-    from app.services.chart_extractor import run_extraction
-
+    # Phase 2: chart pipeline for NAV curves.  Text-only PDFs still continue
+    # to the deterministic monthly-table lane below; a missing curve color is
+    # not evidence that the PDF belongs to the filename's product.
     provider_type = os.getenv("VLM_PROVIDER", "dashscope")
     use_vlm = bool(os.getenv("DASHSCOPE_API_KEY", "")) if provider_type == "dashscope" else bool(os.getenv("VLM_BASE_URL", ""))
     curve_specs = None
+    audits: list[dict[str, Any]] = []
+    chart_job = None
     if not use_vlm:
         colors = _auto_curve_colors_from_pdf(content)
-        if not colors:
-            if not text:
-                raise ValueError("PDF 无可提取文本且未检测到净值曲线颜色，请在研究工具中手动校准")
-            return {"configured": False, "attempted": False, "succeeded": False, "methods": ["PDF 文本层提取"]}  # text-only PDF is acceptable
-        curve_specs = [{"name": stem, "color_hex": colors[0], "color_name": "", "is_benchmark": False}]
+        if colors:
+            curve_specs = [{"name": stem, "color_hex": colors[0], "color_name": "", "is_benchmark": False}]
+        elif not text:
+            raise ValueError("PDF 无可提取文本且未检测到净值曲线颜色，请在研究工具中手动校准")
 
-    try:
-        job = _run_async(run_extraction(
-            pdf_bytes=content,
-            filename=filename,
-            use_vlm=use_vlm,
-            curve_specs=curve_specs,
-        ))
-    except Exception as exc:
-        logger.warning("PDF chart extraction failed: %s", exc)
-        if not text:
-            raise ValueError(f"PDF 图表提取失败：{exc}") from exc
-        return {"configured": use_vlm, "attempted": use_vlm, "succeeded": False, "provider": provider_type if use_vlm else None, "model": os.getenv("VLM_MODEL") if use_vlm else None, "calls": 0, "successful_calls": 0, "failed_calls": 0, "methods": ["PDF 文本层提取"]}
+    if use_vlm or curve_specs:
+        from app.services.chart_extractor import run_extraction
+
+        try:
+            chart_job = _run_async(run_extraction(
+                pdf_bytes=content,
+                filename=filename,
+                use_vlm=use_vlm,
+                curve_specs=curve_specs,
+            ))
+        except Exception as exc:
+            logger.warning("PDF chart extraction failed: %s", exc)
+            if not text:
+                raise ValueError(f"PDF 图表提取失败：{exc}") from exc
+            audits.append({
+                "configured": use_vlm,
+                "attempted": use_vlm,
+                "succeeded": False,
+                "provider": provider_type if use_vlm else None,
+                "model": os.getenv("VLM_MODEL") if use_vlm else None,
+                "calls": 0,
+                "successful_calls": 0,
+                "failed_calls": 0,
+                "errors": [str(exc)[:300]],
+                "methods": ["PDF 文本层提取"],
+            })
 
     traced_products = 0
     traced_targets: list[ProductEntity] = []
-    audits: list[dict[str, Any]] = []
-    for result_index, result in enumerate(job.results):
-        audits.append({
-            "configured": use_vlm,
-            "attempted": bool(result.vlm_attempted),
-            "succeeded": bool(result.vlm_succeeded),
-            "provider": result.vlm_provider or provider_type if use_vlm else None,
-            "model": result.vlm_model or os.getenv("VLM_MODEL", "qwen3-vl-flash") if use_vlm else None,
-            "calls": 1 if result.vlm_attempted else 0,
-            "successful_calls": 1 if result.vlm_succeeded else 0,
-            "failed_calls": 1 if result.vlm_attempted and not result.vlm_succeeded else 0,
-            "errors": [result.vlm_error] if result.vlm_error else [],
-            "methods": ["VLM 结构识别", "CV 像素追踪"] if use_vlm else ["CV 像素追踪（无 VLM）"],
-        })
-        source_page = job.regions[result_index].page_index if result_index < len(job.regions) else 0
-        for curve in result.curves:
-            if curve.is_benchmark:
-                continue
-            points = [
-                {"observation_date": p.date, "nav": p.value}
-                for p in curve.points
-                if p.date and p.value is not None and p.value > 0
-            ]
-            if len(points) < 3:
-                continue
-            curve_name = (curve.name or "").strip()
-            title = (result.structure.chart_title.strip() if result.structure and result.structure.chart_title else "")
-            target_name = curve_name or title or stem
-            if not _looks_like_pdf_product_curve(target_name, stem):
-                logger.info("Skipping non-product PDF curve label %r from %s", target_name, filename)
-                continue
-            target = _find_or_create_product(session, target_name, None, None, None)
-            if target not in traced_targets:
-                traced_targets.append(target)
-            fragment = store.add_fragment(
-                session,
-                file_id=file_id,
-                fragment_type="chart_traced",
-                page_number=source_page + 1,
-                content_text=f"PDF 曲线追踪 {len(points)} 个数据点",
-                content_data={"num_points": len(points), "confidence": result.confidence, "source_page": source_page + 1, "method": "VLM 结构识别 + CV 像素追踪" if use_vlm else "CV 像素追踪（无 VLM）", "review_status": "pending"},
-                ocr_confidence=max(0.3, result.confidence * 0.8),
-                product_id=target.id,
-            )
-            frequency = result.frequency if result.frequency != "unknown" else None
-            candidate_version = store.create_nav_candidate_version(
-                session, target.id, file_id, points,
-                source_fragment_id=fragment.id,
-                frequency=frequency,
-                confidence=max(0.3, result.confidence * 0.8),
-            )
-            fragment.content_data = {**(fragment.content_data or {}), "candidate_version_id": candidate_version.id}
-            session.commit()
-            traced_products += 1
+    if chart_job is not None:
+        for result_index, result in enumerate(chart_job.results):
+            audits.append({
+                "configured": use_vlm,
+                "attempted": bool(result.vlm_attempted),
+                "succeeded": bool(result.vlm_succeeded),
+                "provider": result.vlm_provider or provider_type if use_vlm else None,
+                "model": result.vlm_model or os.getenv("VLM_MODEL", "qwen3-vl-flash") if use_vlm else None,
+                "calls": 1 if result.vlm_attempted else 0,
+                "successful_calls": 1 if result.vlm_succeeded else 0,
+                "failed_calls": 1 if result.vlm_attempted and not result.vlm_succeeded else 0,
+                "errors": [result.vlm_error] if result.vlm_error else [],
+                "methods": ["VLM 结构识别", "CV 像素追踪"] if use_vlm else ["CV 像素追踪（无 VLM）"],
+            })
+            source_page = chart_job.regions[result_index].page_index if result_index < len(chart_job.regions) else 0
+            for curve in result.curves:
+                if curve.is_benchmark:
+                    continue
+                points = [
+                    {"observation_date": p.date, "nav": p.value}
+                    for p in curve.points
+                    if p.date and p.value is not None and p.value > 0
+                ]
+                if len(points) < 3:
+                    continue
+                curve_name = (curve.name or "").strip()
+                title = (result.structure.chart_title.strip() if result.structure and result.structure.chart_title else "")
+                target_name = curve_name or title or stem
+                if not _looks_like_pdf_product_curve(target_name, stem):
+                    logger.info("Skipping non-product PDF curve label %r from %s", target_name, filename)
+                    continue
+                target = _find_or_create_product(session, target_name, None, None, None)
+                if target not in traced_targets:
+                    traced_targets.append(target)
+                fragment = store.add_fragment(
+                    session,
+                    file_id=file_id,
+                    fragment_type="chart_traced",
+                    page_number=source_page + 1,
+                    content_text=f"PDF 曲线追踪 {len(points)} 个数据点",
+                    content_data={"num_points": len(points), "confidence": result.confidence, "source_page": source_page + 1, "method": "VLM 结构识别 + CV 像素追踪" if use_vlm else "CV 像素追踪（无 VLM）", "review_status": "pending"},
+                    ocr_confidence=max(0.3, result.confidence * 0.8),
+                    product_id=target.id,
+                )
+                frequency = result.frequency if result.frequency != "unknown" else None
+                candidate_version = store.create_nav_candidate_version(
+                    session, target.id, file_id, points,
+                    source_fragment_id=fragment.id,
+                    frequency=frequency,
+                    confidence=max(0.3, result.confidence * 0.8),
+                )
+                fragment.content_data = {**(fragment.content_data or {}), "candidate_version_id": candidate_version.id}
+                session.commit()
+                traced_products += 1
 
     reliable_curve = session.execute(
         select(NavCandidateVersion.id).where(
@@ -1759,8 +1767,13 @@ def _ingest_pdf(session: Any, file_id: str, content: bytes, filename: str) -> di
         )
     ).scalar() is not None
     monthly_points = _recover_monthly_nav_from_pdf_text(text, filename=filename) if not reliable_curve else []
-    if len(monthly_points) >= 3:
-        target = traced_targets[0] if traced_targets else _find_or_create_product(session, stem, None, None, None)
+    recovery_target = traced_targets[0] if len(traced_targets) == 1 else None
+    if recovery_target is None and not traced_targets:
+        hinted_name = _normalise_manifest_product_name(product_name_hint)
+        if hinted_name:
+            recovery_target = _find_or_create_product(session, hinted_name, None, None, None)
+    if len(monthly_points) >= 3 and recovery_target is not None:
+        target = recovery_target
         fragment = store.add_fragment(
             session,
             file_id=file_id,
@@ -1787,6 +1800,14 @@ def _ingest_pdf(session: Any, file_id: str, content: bytes, filename: str) -> di
         )
         fragment.content_data = {**(fragment.content_data or {}), "candidate_version_id": candidate.id}
         session.commit()
+    elif len(monthly_points) >= 3:
+        audits.append({
+            "configured": False,
+            "attempted": False,
+            "succeeded": False,
+            "errors": ["PDF 月收益表已读取，但缺少唯一产品绑定；未创建净值候选"],
+            "methods": ["PDF 文本层月收益表（待产品绑定）"],
+        })
 
     if traced_products == 0 and not text:
         raise ValueError("PDF 未提取到文本或净值曲线，请在研究工具中手动校准")

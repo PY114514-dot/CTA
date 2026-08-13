@@ -171,6 +171,7 @@ class NavReplaceRequest(BaseModel):
     points: list[NavPointInput] = Field(min_length=2)
     frequency: str | None = None
     source_file_id: str | None = None
+    source_fragment_id: str | None = None
     reviewed_by: str = "user"
 
     @classmethod
@@ -1076,8 +1077,15 @@ def publish_nav_candidate(candidate_id: str, body: NavCandidatePublishRequest, s
     candidate.status = "published"
     from datetime import datetime
     candidate.published_at = datetime.now()
+    finalization = store.finalize_manual_nav_review(
+        session,
+        file_id=candidate.source_file_id,
+        product_id=candidate.product_id,
+        fragment_id=candidate.source_fragment_id,
+        reviewed_by=body.reviewed_by,
+    )
     session.commit()
-    return {"candidate_id": candidate_id, "mode": body.mode, "published": published, "product_id": candidate.product_id}
+    return {"candidate_id": candidate_id, "mode": body.mode, "published": published, "product_id": candidate.product_id, "review_finalization": finalization}
 
 
 @router.put("/products/{product_id}/nav")
@@ -1088,6 +1096,12 @@ def replace_nav_series(product_id: str, body: NavReplaceRequest, session: Sessio
         raise HTTPException(404, "Product not found")
     if body.source_file_id and session.get(store.RawFile, body.source_file_id) is None:
         raise HTTPException(404, "来源文件不存在")
+    if body.source_fragment_id:
+        fragment = session.get(DocumentFragment, body.source_fragment_id)
+        if fragment is None or fragment.file_id != body.source_file_id:
+            raise HTTPException(422, "来源片段不属于该来源文件")
+        if fragment.product_id not in {None, product_id}:
+            raise HTTPException(422, "来源片段不属于当前产品")
     count = store.replace_nav_observations(
         session,
         product_id,
@@ -1100,7 +1114,24 @@ def replace_nav_series(product_id: str, body: NavReplaceRequest, session: Sessio
         product.nav_frequency = body.frequency
         product.close_date = max((point.observation_date for point in body.points), default=product.close_date)
         session.commit()
-    return {"product_id": product_id, "saved": count, "review_status": "reviewed"}
+    review_finalization = None
+    if body.source_file_id:
+        try:
+            review_finalization = store.finalize_manual_nav_review(
+                session,
+                file_id=body.source_file_id,
+                product_id=product_id,
+                fragment_id=body.source_fragment_id,
+                reviewed_by=body.reviewed_by,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    return {
+        "product_id": product_id,
+        "saved": count,
+        "review_status": "reviewed",
+        "review_finalization": review_finalization,
+    }
 
 
 @router.patch("/nav/review")

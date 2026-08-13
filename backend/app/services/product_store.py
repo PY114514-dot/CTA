@@ -690,6 +690,103 @@ def replace_nav_observations(
     return len(points)
 
 
+def finalize_manual_nav_review(
+    session: Session,
+    *,
+    file_id: str,
+    product_id: str,
+    fragment_id: str | None = None,
+    reviewed_by: str = "user",
+) -> dict[str, Any]:
+    """Persist the one-time human decision for a source material.
+
+    A manual NAV save is a terminal review decision for the selected source
+    evidence. It marks that evidence reviewed, retires machine candidates
+    replaced by the manual series, and records a terminal workflow state so a
+    later product-library refresh never schedules VLM/CV again for it.
+    """
+    record = session.get(RawFile, file_id)
+    if record is None:
+        raise ValueError("来源文件不存在")
+    if fragment_id is not None:
+        fragment = session.get(DocumentFragment, fragment_id)
+        if fragment is None or fragment.file_id != file_id:
+            raise ValueError("来源片段不属于该文件")
+        if fragment.product_id not in {None, product_id}:
+            raise ValueError("来源片段不属于当前产品")
+        fragments = [fragment]
+    else:
+        fragments = list(session.execute(
+            select(DocumentFragment).where(
+                DocumentFragment.file_id == file_id,
+                DocumentFragment.product_id == product_id,
+            )
+        ).scalars().all())
+
+    reviewed_at = datetime.now()
+    for fragment in fragments:
+        content_data = dict(fragment.content_data or {})
+        content_data.update({
+            "review_status": "reviewed",
+            "reviewed_by": reviewed_by,
+            "reviewed_at": reviewed_at.isoformat(),
+            "workflow_stage": "human_reviewed",
+        })
+        fragment.content_data = content_data
+
+    candidate_query = select(NavCandidateVersion).where(
+        NavCandidateVersion.source_file_id == file_id,
+        NavCandidateVersion.product_id == product_id,
+        NavCandidateVersion.status == "pending",
+    )
+    if fragment_id is not None:
+        candidate_query = candidate_query.where(NavCandidateVersion.source_fragment_id == fragment_id)
+    retired_candidates = list(session.execute(candidate_query).scalars().all())
+    for candidate in retired_candidates:
+        candidate.status = "discarded"
+
+    unresolved = session.execute(
+        select(DocumentFragment.id).where(
+            DocumentFragment.file_id == file_id,
+            (DocumentFragment.product_id.is_(None))
+            | (DocumentFragment.content_data["binding_status"].as_string() == "unmatched"),
+        )
+    ).scalars().all()
+    audit = dict(record.extraction_audit or {})
+    workflow = dict(audit.get("workflow") or {})
+    workflow.update({
+        "stage": "human_review",
+        "identity": "resolved",
+        "trace": "human_reviewed",
+        "next_action": "confirm_product_binding" if unresolved else "none",
+        "reviewed_by": reviewed_by,
+        "reviewed_at": reviewed_at.isoformat(),
+    })
+    audit["workflow"] = workflow
+    audit["human_review"] = {
+        "status": "permanently_saved",
+        "product_id": product_id,
+        "fragment_id": fragment_id,
+        "reviewed_by": reviewed_by,
+        "reviewed_at": reviewed_at.isoformat(),
+    }
+    record.extraction_audit = audit
+    if unresolved:
+        record.parsing_status = "completed_no_nav"
+        record.parsing_error = "当前产品净值已人工审核；文件仍有其他曲线或片段待确认绑定"
+    else:
+        record.parsing_status = "completed"
+        record.parsing_error = None
+    session.commit()
+    return {
+        "file_id": file_id,
+        "product_id": product_id,
+        "fragment_id": fragment_id,
+        "reviewed_fragments": len(fragments),
+        "retired_candidates": len(retired_candidates),
+    }
+
+
 def get_nav_series(
     session: Session, product_id: str, *, reviewed_only: bool = False
 ) -> list[NavObservation]:

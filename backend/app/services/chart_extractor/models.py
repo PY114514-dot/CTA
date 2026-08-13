@@ -132,6 +132,10 @@ class ChartExtractResult(BaseModel):
     # review state, not a failed extraction.  The browser uses this to enter
     # one-click colour-pick mode while preserving the located chart frame.
     needs_color_pick: bool = False
+    # One auditable gate for every automatic result.  A trace can be visually
+    # sound yet still require axis calibration before it is safe NAV data.
+    review_required: bool = True
+    review_reasons: list[str] = Field(default_factory=list)
     # If the chart was auto-cropped from a larger page, the (x, y) offset of the
     # crop's top-left corner in the original image. Traced point coordinates are
     # relative to the crop; add this offset to place them on the original image.

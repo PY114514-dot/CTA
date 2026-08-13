@@ -188,15 +188,17 @@ async def extract_chart(
         # that case expose the CV frame as a reviewable fallback rather than
         # returning no frame at all.
         fallback_area, fallback_source = _choose_plot_area(img, detect_plot_area(img), structure)
-        y_anchors_for_review: list[AxisAnchor] = []
+        y_values_for_review: list[float] = []
         if structure is not None and len(structure.y_range) != 2:
             if provider is not None:
                 values = await _read_y_axis_focused(img, fallback_area, provider)
                 if len(values) >= 2:
-                    y_anchors_for_review = _anchors_from_values(values, fallback_area, axis="y")
-            if not y_anchors_for_review:
+                    y_values_for_review = values
+            if not y_values_for_review:
                 y_anchors_for_review = _read_y_axis_ocr(img, fallback_area)
-            structure = _structure_with_y_anchors(structure, y_anchors_for_review)
+                structure = _structure_with_y_anchors(structure, y_anchors_for_review)
+            else:
+                structure = _structure_with_y_values(structure, y_values_for_review)
         return ChartExtractResult(
             structure=structure,
             plot_area=fallback_area,
@@ -237,35 +239,31 @@ async def extract_chart(
     y_axis_anchors = _build_axis_anchors(y_anchors, "y")
     x_axis_anchors = _build_axis_anchors(x_anchors, "x")
 
-    # Auto-locate tick pixel positions from VLM labels when no manual anchors
+    # Auto-locate tick pixel positions from VLM labels when no manual anchors.
+    # The locator returns anchors only when each label has direct pixel evidence.
     if not y_axis_anchors and structure and structure.y_ticks:
         y_axis_anchors = locate_y_ticks(img, plot_area, structure.y_ticks)
         logger.info("Auto-located %d Y tick anchors", len(y_axis_anchors))
 
     # Zero-cost manual path: user typed the Y tick labels (bottom→top).
-    # Reuse locate_y_ticks to find their pixel positions via grid lines /
-    # even spacing — no VLM required.
+    # Reuse locate_y_ticks to find their pixel positions via detected grid
+    # lines — no VLM required.
     if not y_axis_anchors and y_tick_labels:
         y_axis_anchors = locate_y_ticks(img, plot_area, y_tick_labels)
         logger.info("Y ticks from %d user-provided labels", len(y_axis_anchors))
 
-    # Fallback: if Y labels were unparseable (e.g. VLM read "%"), do a
-    # focused re-read on a zoomed crop of the Y-axis strip.
+    # If Y labels were unparseable (e.g. VLM read "%"), do a focused re-read
+    # on a zoomed crop of the Y-axis strip.  Its values update the displayed
+    # range, but without pixel boxes they are not calibration anchors.
     if not y_axis_anchors and use_vlm and provider is not None:
         y_values = await _read_y_axis_focused(img, plot_area, provider)
         if y_values:
-            y_axis_anchors = _anchors_from_values(y_values, plot_area, axis="y")
-            logger.info("Y-axis focused re-read: %d anchors", len(y_axis_anchors))
+            structure = _structure_with_y_values(structure, y_values)
+            logger.info("Y-axis focused re-read: %d values for review", len(y_values))
 
-    # Last resort: use VLM-reported y_range [min, max] for 2-point calibration
-    if not y_axis_anchors and structure and len(structure.y_range) == 2:
-        y_min, y_max = structure.y_range
-        if y_max > y_min:
-            y_axis_anchors = [
-                AxisAnchor(axis="y", px=plot_area.bottom, value=y_min, label=str(y_min)),
-                AxisAnchor(axis="y", px=plot_area.top, value=y_max, label=str(y_max)),
-            ]
-            logger.info("Y calibration from y_range: [%.4f, %.4f]", y_min, y_max)
+    # A VLM y_range has values but no pixel correspondences.  Do not turn the
+    # plot rectangle into synthetic anchors; the result must remain a review
+    # candidate until the user or OCR supplies actual tick positions.
 
     if not x_axis_anchors and x_labels:
         x_axis_anchors = locate_x_ticks(img, plot_area, x_labels)
@@ -306,12 +304,18 @@ async def extract_chart(
             vlm_error=vlm_error,
         )
 
-    # --- Step 6: Assemble result ---
+    # --- Step 6: Apply one quality gate ---
     frequency = structure.frequency if structure else "unknown"
     confidence = _estimate_confidence(traced, y_axis_anchors)
     unreliable = [curve for curve in traced if not curve.is_benchmark and not curve.quality.get("is_reliable", False)]
+    review_reasons = []
     if unreliable:
-        names = ", ".join(curve.name or "产品曲线" for curve in unreliable)
+        review_reasons.append("trace_unreliable")
+    if len(y_axis_anchors) < 2:
+        review_reasons.append("y_axis_unverified")
+    if len(x_axis_anchors) < 2 or not x_labels:
+        review_reasons.append("x_axis_unverified")
+    if review_reasons:
         return ChartExtractResult(
             structure=structure,
             plot_area=plot_area,
@@ -319,8 +323,10 @@ async def extract_chart(
             curves=traced,
             frequency=frequency,
             confidence=min(confidence, 0.45),
-            warnings=["CV 曲线未通过覆盖率或连续性质量门槛，已转入取色/日期首尾兜底。"],
-            needs_color_pick=True,
+            warnings=["自动识别证据不足，候选曲线仅供人工校准，不会自动作为净值数据。"],
+            needs_color_pick=bool(unreliable),
+            review_required=True,
+            review_reasons=review_reasons,
             error=None,
             vlm_attempted=vlm_attempted,
             vlm_succeeded=vlm_succeeded,
@@ -336,6 +342,8 @@ async def extract_chart(
         curves=traced,
         frequency=frequency,
         confidence=confidence,
+        review_required=False,
+        review_reasons=[],
         vlm_attempted=vlm_attempted,
         vlm_succeeded=vlm_succeeded,
         vlm_provider=vlm_provider,
@@ -435,7 +443,8 @@ async def _read_y_axis_focused(
         raw = await provider.extract_structure(buf.tobytes(), Y_AXIS_PROMPT)
         values = parse_y_axis_response(raw)
         # VLM often returns values top-to-bottom (visual order).
-        # _anchors_from_values expects bottom-to-top. Auto-detect and fix.
+        # The focused values are display metadata only; without OCR boxes or
+        # grid lines they cannot calibrate pixel coordinates.
         if len(values) >= 2 and values[0] > values[-1]:
             values = values[::-1]
         logger.info("Y-axis focused read: %s -> %s", raw[:80], values)
@@ -539,48 +548,26 @@ def _structure_with_y_anchors(
     structure: ChartStructure | None,
     anchors: list[AxisAnchor],
 ) -> ChartStructure | None:
-    """Expose a validated OCR range to the browser's lightweight recovery flow."""
+    """Expose OCR labels and range while retaining their pixel evidence."""
     if len(anchors) < 2:
         return structure
     result = structure.model_copy(deep=True) if structure is not None else ChartStructure(source="ocr")
-    result.y_ticks = [anchor.label for anchor in anchors]
     result.y_range = [anchors[0].value, anchors[-1].value]
+    result.y_ticks = [anchor.label for anchor in anchors]
     return result
 
 
-def _anchors_from_values(
+def _structure_with_y_values(
+    structure: ChartStructure | None,
     values: list[float],
-    plot_area: PlotArea,
-    axis: str = "y",
-) -> list[AxisAnchor]:
-    """Build evenly-spaced AxisAnchors from parsed tick values.
-
-    values are ordered bottom→top for the Y axis (as the VLM reports).
-    Pixel positions are assigned by even spacing across the plot area.
-    """
-    n = len(values)
-    if n == 0:
-        return []
-
-    anchors = []
-    if axis == "y":
-        # bottom→top values map to large→small pixel y
-        for i, val in enumerate(values):
-            if n == 1:
-                px = (plot_area.top + plot_area.bottom) // 2
-            else:
-                frac = i / (n - 1)  # 0 = bottom, 1 = top
-                px = int(plot_area.bottom - frac * (plot_area.bottom - plot_area.top))
-            anchors.append(AxisAnchor(axis="y", px=px, value=val, label=str(val)))
-    else:
-        for i, val in enumerate(values):
-            if n == 1:
-                px = (plot_area.left + plot_area.right) // 2
-            else:
-                px = int(plot_area.left + (i / (n - 1)) * (plot_area.right - plot_area.left))
-            anchors.append(AxisAnchor(axis="x", px=px, value=val, label=str(val)))
-
-    return anchors
+) -> ChartStructure | None:
+    """Expose parsed Y values for review without claiming pixel positions."""
+    if len(values) < 2:
+        return structure
+    result = structure.model_copy(deep=True) if structure is not None else ChartStructure(source="vlm")
+    result.y_ticks = [str(value) for value in values]
+    result.y_range = [values[0], values[-1]]
+    return result
 
 
 def _estimate_confidence(traced: list[TracedCurve], y_anchors: list[AxisAnchor]) -> float:

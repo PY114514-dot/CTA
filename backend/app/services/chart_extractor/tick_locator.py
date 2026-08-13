@@ -3,8 +3,7 @@
 The VLM reads tick LABELS (dates, values) but not their pixel positions.
 This module locates tick pixel positions so pixel_tracer can calibrate:
 
-- X axis (dates): detect vertical grid lines, or fall back to even spacing
-  (time-series charts almost always use uniform time spacing).
+- X axis (dates): detect vertical grid lines.
 - Y axis (values): detect horizontal grid lines and match to labels.
 
 No OCR involved — pure geometry + the labels the VLM already read.
@@ -91,10 +90,9 @@ def locate_x_ticks(
 ) -> list[AxisAnchor]:
     """Locate X axis tick pixel positions for the given date labels.
 
-    Strategy:
-    1. If vertical grid lines count matches label count, use them.
-    2. Otherwise assume even spacing across the plot width (standard for
-       time-series charts with uniform frequency).
+    Labels without image positions are not enough for calibration.  Return no
+    anchors when the chart does not contain a usable set of vertical grid
+    lines; the caller will route the result to manual review.
     """
     n = len(x_labels)
     if n == 0:
@@ -105,15 +103,13 @@ def locate_x_ticks(
     # Filter grid lines that span a reasonable range
     usable = [x for x in v_lines if plot_area.left < x < plot_area.right]
 
-    # If grid line count matches tick count (within tolerance), use them
-    if usable and abs(len(usable) - n) <= max(1, n // 5):
-        # Match by order; if counts differ, interpolate
-        positions = _match_positions(usable, n, plot_area.left, plot_area.right)
-        logger.info("X ticks from %d grid lines -> %d positions", len(usable), n)
-    else:
-        # Even spacing fallback
-        positions = _even_spacing(n, plot_area.left, plot_area.right)
-        logger.info("X ticks from even spacing (%d labels)", n)
+    if len(usable) != n:
+        logger.info("X tick pixel evidence insufficient: %d grid lines for %d labels", len(usable), n)
+        return []
+
+    # Every returned anchor must correspond to a detected grid line.
+    positions = [float(position) for position in sorted(usable)]
+    logger.info("X ticks from %d grid lines -> %d positions", len(usable), n)
 
     return [
         AxisAnchor(axis="x", px=int(pos), value=float(i), label=x_labels[i])
@@ -145,77 +141,23 @@ def locate_y_ticks(
 
     n = len(parsed)
 
-    # Check if tick values are uniformly spaced (very common in financial charts)
-    if _is_uniform_spacing([v for _, v in parsed]):
-        # Even spacing is more robust than grid line interpolation —
-        # it only depends on plot area boundaries, not noisy line detection.
-        positions = _even_spacing(n, plot_area.top, plot_area.bottom)
-        positions = positions[::-1]  # reverse: first label (bottom) = largest pixel y
-        logger.info("Y ticks from even spacing (%d uniform labels)", n)
-    else:
-        # Irregular ticks — need grid lines to locate positions
-        _, h_lines = detect_grid_lines(img_bgr, plot_area)
-        usable = [y for y in h_lines if plot_area.top < y < plot_area.bottom]
+    _, h_lines = detect_grid_lines(img_bgr, plot_area)
+    usable = [y for y in h_lines if plot_area.top < y < plot_area.bottom]
+    if not usable or len(usable) != n:
+        logger.info("Y tick pixel evidence insufficient: %d grid lines for %d labels", len(usable), n)
+        return []
 
-        if usable and abs(len(usable) - n) <= max(1, n // 4):
-            positions = _match_positions(usable, n, plot_area.top, plot_area.bottom)
-            # _match_positions returns ascending pixel-y (top→bottom),
-            # but parsed labels are bottom→top. Reverse to align.
-            positions = positions[::-1]
-            logger.info("Y ticks from %d grid lines -> %d positions", len(usable), n)
-        else:
-            # Fallback to even spacing
-            positions = _even_spacing(n, plot_area.top, plot_area.bottom)
-            positions = positions[::-1]
-            logger.info("Y ticks from even spacing fallback (%d labels)", n)
+    positions = [float(position) for position in sorted(usable)]
+    # Detected lines are ascending pixel-y (top→bottom), but parsed labels are
+    # bottom→top. Reverse to align.
+    positions = positions[::-1]
+    logger.info("Y ticks from %d grid lines -> %d positions", len(usable), n)
 
     anchors = []
     for i, (label, val) in enumerate(parsed):
         anchors.append(AxisAnchor(axis="y", px=int(positions[i]), value=val, label=label))
 
     return anchors
-
-
-def _is_uniform_spacing(values: list[float], tol: float = 0.01) -> bool:
-    """Check if values are approximately uniformly spaced."""
-    if len(values) < 3:
-        return True  # with 2 or fewer points, spacing is trivially uniform
-    diffs = [values[i + 1] - values[i] for i in range(len(values) - 1)]
-    mean_diff = sum(diffs) / len(diffs)
-    if abs(mean_diff) < 1e-9:
-        return False
-    return all(abs(d - mean_diff) / abs(mean_diff) < tol for d in diffs)
-
-
-def _match_positions(
-    line_positions: list[int], n: int, lo: int, hi: int
-) -> list[float]:
-    """Match detected line positions to n tick positions by interpolation."""
-    line_positions = sorted(line_positions)
-    m = len(line_positions)
-
-    if m == n:
-        return [float(p) for p in line_positions]
-
-    # Interpolate: map m detected lines onto n ticks
-    result = []
-    for i in range(n):
-        # Position of tick i in "line index" space
-        idx = i * (m - 1) / max(n - 1, 1)
-        lo_idx = int(idx)
-        hi_idx = min(lo_idx + 1, m - 1)
-        frac = idx - lo_idx
-        pos = line_positions[lo_idx] * (1 - frac) + line_positions[hi_idx] * frac
-        result.append(float(pos))
-    return result
-
-
-def _even_spacing(n: int, lo: int, hi: int) -> list[float]:
-    """Generate n evenly spaced positions between lo and hi."""
-    if n == 1:
-        return [float((lo + hi) / 2)]
-    step = (hi - lo) / (n - 1)
-    return [lo + i * step for i in range(n)]
 
 
 def _parse_tick_value(label: str) -> float | None:

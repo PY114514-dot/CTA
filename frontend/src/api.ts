@@ -1191,6 +1191,10 @@ export interface ExtractChartResult {
   vlm_model?: string | null;
   vlm_error?: string | null;
   warnings?: string[];
+  /** True when the result is a candidate and must be manually calibrated. */
+  review_required?: boolean;
+  /** Quality-gate identifiers explaining why automatic adoption is blocked. */
+  review_reasons?: string[];
 }
 
 /** Response from the single-image extraction endpoint. */
@@ -2063,8 +2067,8 @@ export async function kbGetReviewPage(fileId: string, productId: string): Promis
 export async function kbReplaceNavSeries(
   productId: string,
   points: NavPoint[],
-  options?: { frequency?: string; sourceFileId?: string },
-): Promise<{ product_id: string; saved: number; review_status: "reviewed" }> {
+  options?: { frequency?: string; sourceFileId?: string; sourceFragmentId?: string },
+): Promise<{ product_id: string; saved: number; review_status: "reviewed"; review_finalization?: Record<string, unknown> | null }> {
   const response = await fetch(`${API_BASE_URL}/kb/products/${productId}/nav`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
@@ -2072,6 +2076,7 @@ export async function kbReplaceNavSeries(
       points: points.map((point) => ({ observation_date: point.observation_date, nav: point.net_asset_value })),
       frequency: options?.frequency,
       source_file_id: options?.sourceFileId,
+      source_fragment_id: options?.sourceFragmentId,
     }),
   });
   if (!response.ok) throw new Error(await errorMessage(response, "保存校准净值失败"));

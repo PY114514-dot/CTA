@@ -91,6 +91,21 @@ const { Paragraph, Title, Text } = Typography;
 /** Research starts empty: sample NAV must never be mistaken for product data. */
 const SAMPLE_NAV_TEXT = "";
 
+function getReviewBlockMessage(
+  conflictReasons: string[],
+  conflictConfirmed: boolean,
+  chartReviewReasons: string[],
+  chartReviewConfirmed: boolean,
+): string | undefined {
+  if (conflictReasons.length > 0 && !conflictConfirmed) {
+    return "请先在原图核对冲突点，并勾选人工复核确认后再计算。";
+  }
+  if (chartReviewReasons.length > 0 && !chartReviewConfirmed) {
+    return "图表识别结果仍是候选，请先对照原图完成曲线、坐标和日期校准。";
+  }
+  return undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Main application
 // ---------------------------------------------------------------------------
@@ -173,6 +188,8 @@ function App(): React.JSX.Element {
   const [isSavingCalibration, setIsSavingCalibration] = useState(false);
   const [calibrationConflictReasons, setCalibrationConflictReasons] = useState<string[]>([]);
   const [manualConflictConfirmed, setManualConflictConfirmed] = useState(false);
+  const [chartReviewReasons, setChartReviewReasons] = useState<string[]>([]);
+  const [chartReviewConfirmed, setChartReviewConfirmed] = useState(false);
   const accentPreset = useMemo(() => getPreset(accentKey), [accentKey]);
   const themeConfig = useMemo(() => buildSerifTheme(accentPreset), [accentPreset]);
 
@@ -272,6 +289,16 @@ function App(): React.JSX.Element {
       setAnalysisError("至少需要两条有效净值记录才能计算。");
       return;
     }
+    const reviewBlockMessage = getReviewBlockMessage(
+      calibrationConflictReasons,
+      manualConflictConfirmed,
+      chartReviewReasons,
+      chartReviewConfirmed,
+    );
+    if (reviewBlockMessage) {
+      setAnalysisError(reviewBlockMessage);
+      return;
+    }
     setIsAnalyzing(true);
     try {
       const result = await analyzeNav(parseNavText(navText), frequency, riskFreeRate);
@@ -287,7 +314,7 @@ function App(): React.JSX.Element {
     } finally {
       setIsAnalyzing(false);
     }
-  }, [canAnalyzeText, frequency, navText, riskFreeRate]);
+  }, [calibrationConflictReasons.length, canAnalyzeText, chartReviewConfirmed, chartReviewReasons.length, frequency, manualConflictConfirmed, navText, riskFreeRate]);
 
   // Keyboard shortcut: Ctrl/Cmd + Enter triggers analysis from the textarea.
   useEffect(() => {
@@ -300,11 +327,31 @@ function App(): React.JSX.Element {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [handleAnalysis]);
 
-  async function handleChartApply(navTextValue: string): Promise<void> {
+  async function handleChartApply(navTextValue: string, reviewConfirmed = false): Promise<void> {
     setNavText(navTextValue);
+    setManualConflictConfirmed(false);
+    setChartReviewReasons(reviewConfirmed ? [] : ["review_required"]);
+    setChartReviewConfirmed(reviewConfirmed);
     setAnalysisResult(undefined);
     setAnalysisError(undefined);
     setBenchmarkCumulativeReturn(undefined);
+    if (!reviewConfirmed) {
+      setWorkflowStep(0);
+      setImportMessage("图表结果已写入候选区，但尚未完成人工复核；请对照原图确认曲线、坐标和日期后再计算。");
+      return;
+    }
+    const reviewBlockMessage = getReviewBlockMessage(
+      calibrationConflictReasons,
+      false,
+      [],
+      true,
+    );
+    if (reviewBlockMessage) {
+      setWorkflowStep(0);
+      setAnalysisError(reviewBlockMessage);
+      setImportMessage("图表结果已写入候选区；请先完成产品资料冲突复核，再计算。");
+      return;
+    }
     try {
       const points = parseNavText(navTextValue);
       if (points.length < 2) throw new Error("提取结果不足两条有效净值记录。");
@@ -345,6 +392,8 @@ function App(): React.JSX.Element {
     setAnalysisError(undefined);
     setCalibrationConflictReasons(product.nav_quality?.reasons ?? []);
     setManualConflictConfirmed(false);
+    setChartReviewReasons([]);
+    setChartReviewConfirmed(false);
     try {
       const nav = await kbGetNavSeries(product.id);
       if (requestId !== calibrationRequestIdRef.current) return;
@@ -364,6 +413,9 @@ function App(): React.JSX.Element {
         ? sourcePoints
         : sampleWeeklyNav(sourcePoints);
       const candidateFrequency = preferredCandidate?.frequency;
+      const usingPendingCandidate = nav.length === 0 && Boolean(preferredCandidate);
+      setChartReviewReasons(usingPendingCandidate ? ["candidate_pending_review"] : []);
+      setChartReviewConfirmed(false);
       if (preferredCandidate) {
         setImportMessage(
           candidateFrequency === "monthly"
@@ -422,6 +474,16 @@ function App(): React.JSX.Element {
       setAnalysisError("请先在原图核对冲突点，并勾选人工复核确认后再保存。");
       return;
     }
+    const reviewBlockMessage = getReviewBlockMessage(
+      [],
+      true,
+      chartReviewReasons,
+      chartReviewConfirmed,
+    );
+    if (reviewBlockMessage) {
+      setAnalysisError(reviewBlockMessage);
+      return;
+    }
     const productId = calibratingProductId;
     const calibrationRequestId = calibrationRequestIdRef.current;
     const saveRequestId = ++calibrationSaveRequestIdRef.current;
@@ -450,7 +512,7 @@ function App(): React.JSX.Element {
     } finally {
       if (isCurrentSave()) setIsSavingCalibration(false);
     }
-  }, [calibratingProductId, calibrationConflictReasons.length, calibrationSourceFileId, frequency, manualConflictConfirmed, navText, riskFreeRate]);
+  }, [calibratingProductId, calibrationConflictReasons.length, calibrationSourceFileId, chartReviewConfirmed, chartReviewReasons.length, frequency, manualConflictConfirmed, navText, riskFreeRate]);
 
   async function handleImageImport(
     lineKind: "product" | "benchmark" = "product",
@@ -465,17 +527,14 @@ function App(): React.JSX.Element {
       if (result.extractionFrequency) setFrequency(result.extractionFrequency);
       setCandidateCurve((result.candidateCurve ?? []).map((point) => ({ x: point.x_ratio, y: point.y_ratio })));
       setCandidateConfidence(result.confidence);
+      setManualConflictConfirmed(false);
+      setChartReviewReasons(["manual_digitization_candidate"]);
+      setChartReviewConfirmed(false);
       setIsCurveEditMode(false);
       setAutoFitMessage(undefined);
       // A freshly digitized product series invalidates any prior benchmark.
       setBenchmarkCumulativeReturn(undefined);
-      try {
-        // This is an estimate from the candidate series, deliberately kept on
-        // the review page rather than treated as reviewed research data.
-        setAnalysisResult(await analyzeNav(parseNavText(result.navText), result.extractionFrequency ?? frequency, riskFreeRate));
-      } catch {
-        setAnalysisResult(undefined);
-      }
+      setAnalysisResult(undefined);
     }
     if (result.benchmarkReturn !== undefined) {
       setBenchmarkCumulativeReturn(result.benchmarkReturn);
@@ -498,6 +557,10 @@ function App(): React.JSX.Element {
       const response = await extractSingleImage(pendingImage, undefined, { useVlm: true });
       if (requestId !== smartExtractionRequestIdRef.current) return;
       const result = response.result;
+      const reviewRequired = result.review_required !== false;
+      const reviewReasons = reviewRequired
+        ? (result.review_reasons?.length ? result.review_reasons : ["review_required"])
+        : [];
       const sourceLabel = calibrationSourceIsPdf && calibrationSourcePage
         ? `当前来源：PDF 第 ${calibrationSourcePage} 页。`
         : "当前来源：原图。";
@@ -586,13 +649,32 @@ function App(): React.JSX.Element {
       setFrequency(extractedFrequency);
       setCandidateCurve(candidate);
       setCandidateConfidence(result.confidence);
+      setManualConflictConfirmed(false);
+      setChartReviewReasons(reviewReasons);
+      setChartReviewConfirmed(false);
       setIsCurveEditMode(false);
-      setImportMessage(`${sourceLabel}${vlmLabel}CV 已在定位图框内追踪 ${valid.length} 个${extractedFrequency === "weekly" ? "周频" : extractedFrequency === "monthly" ? "月频" : "日频"}点；置信度 ${(result.confidence * 100).toFixed(0)}%。请直接核对虚线，只有不贴合时才打开高级校准。`);
-      try {
-        const analysis = await analyzeNav(parseNavText(text), extractedFrequency, riskFreeRate);
-        if (requestId === smartExtractionRequestIdRef.current) setAnalysisResult(analysis);
-      } catch {
-        if (requestId === smartExtractionRequestIdRef.current) setAnalysisResult(undefined);
+      setAnalysisResult(undefined);
+      if (reviewRequired) {
+        setImportMessage(`${sourceLabel}${vlmLabel}CV 已在定位图框内追踪 ${valid.length} 个${extractedFrequency === "weekly" ? "周频" : extractedFrequency === "monthly" ? "月频" : "日频"}候选点；置信度 ${(result.confidence * 100).toFixed(0)}%。${reviewReasons.join("、")}。请先对照原图完成人工校准并确认，不能直接进入研究。`);
+      } else {
+        setImportMessage(`${sourceLabel}${vlmLabel}CV 已在定位图框内追踪 ${valid.length} 个${extractedFrequency === "weekly" ? "周频" : extractedFrequency === "monthly" ? "月频" : "日频"}点；置信度 ${(result.confidence * 100).toFixed(0)}%。请直接核对虚线。`);
+        const reviewBlockMessage = getReviewBlockMessage(
+          calibrationConflictReasons,
+          manualConflictConfirmed,
+          [],
+          true,
+        );
+        if (reviewBlockMessage) {
+          setAnalysisError(reviewBlockMessage);
+          setImportMessage("识别结果已写入候选区；请先完成产品资料冲突复核，再计算。");
+          return;
+        }
+        try {
+          const analysis = await analyzeNav(parseNavText(text), extractedFrequency, riskFreeRate);
+          if (requestId === smartExtractionRequestIdRef.current) setAnalysisResult(analysis);
+        } catch {
+          if (requestId === smartExtractionRequestIdRef.current) setAnalysisResult(undefined);
+        }
       }
     } catch (error) {
       if (requestId !== smartExtractionRequestIdRef.current) return;
@@ -600,7 +682,7 @@ function App(): React.JSX.Element {
     } finally {
       if (requestId === smartExtractionRequestIdRef.current) setIsSmartDigitizing(false);
     }
-  }, [applyLocatedChart, calibrationSourceIsPdf, calibrationSourcePage, imagePreviewUrl, pendingImage, riskFreeRate, setImageEndDate, setImageStartDate]);
+  }, [applyLocatedChart, calibrationConflictReasons, calibrationSourceIsPdf, calibrationSourcePage, imagePreviewUrl, manualConflictConfirmed, pendingImage, riskFreeRate, setImageEndDate, setImageStartDate]);
 
   const handleCalibrationImageClick = useCallback(async (event: React.MouseEvent<HTMLImageElement>): Promise<void> => {
     if (!isPickingCurveColor || !pendingImage) {
@@ -707,6 +789,8 @@ function App(): React.JSX.Element {
     setReportedCumulativeReturn(undefined);
     setCandidateCurve([]);
     setCandidateConfidence(undefined);
+    setChartReviewReasons([]);
+    setChartReviewConfirmed(false);
     setIsCurveEditMode(false);
     setAutoFitMessage(undefined);
     resetIdentity();
@@ -898,10 +982,17 @@ function App(): React.JSX.Element {
 
                 <NavImportReviewPanel
                   navText={navText}
-                  onNavTextChange={setNavText}
+                  onNavTextChange={(value) => {
+                    setNavText(value);
+                    if (calibrationConflictReasons.length > 0) setManualConflictConfirmed(false);
+                    if (chartReviewReasons.length > 0) setChartReviewConfirmed(false);
+                  }}
                   conflictReasons={calibrationConflictReasons}
                   conflictConfirmed={manualConflictConfirmed}
                   onConflictConfirmedChange={setManualConflictConfirmed}
+                  chartReviewReasons={chartReviewReasons}
+                  chartReviewConfirmed={chartReviewConfirmed}
+                  onChartReviewConfirmedChange={setChartReviewConfirmed}
                   isCalibrating={Boolean(calibratingProductId)}
                   isSaving={isSavingCalibration}
                   isAnalyzing={isAnalyzing}
@@ -1044,7 +1135,7 @@ function App(): React.JSX.Element {
         <ChartExtractDrawer
           open={chartExtractOpen}
           onClose={() => setChartExtractOpen(false)}
-          onApplyToWorkspace={(navTextValue) => { void handleChartApply(navTextValue); }}
+          onApplyToWorkspace={(navTextValue, confirmed) => { void handleChartApply(navTextValue, confirmed); }}
         />
 
         <SettingsDrawer
