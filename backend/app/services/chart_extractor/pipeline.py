@@ -146,6 +146,13 @@ async def extract_chart(
                 enhanced = preprocess_chart_image(image_bytes)
                 raw = await provider.extract_structure(enhanced)
                 structure = parse_structure_response(raw)
+                # A partial read containing only adjacent date labels would
+                # compress a multi-year curve into days. Retry that specific
+                # weak result once; otherwise retain it for manual review.
+                if _date_label_span_days(structure.x_ticks) < 30:
+                    retry = parse_structure_response(await provider.extract_structure(enhanced))
+                    if _date_label_span_days(retry.x_ticks) > _date_label_span_days(structure.x_ticks):
+                        structure = retry
                 vlm_succeeded = True
                 curve_specs = trusted_curve_specs or structure.curves
                 x_labels = x_labels or structure.x_ticks
@@ -252,6 +259,11 @@ async def extract_chart(
         y_axis_anchors = locate_y_ticks(img, plot_area, y_tick_labels)
         logger.info("Y ticks from %d user-provided labels", len(y_axis_anchors))
 
+    if not y_axis_anchors:
+        y_axis_anchors = _read_y_axis_ocr(img, plot_area)
+        if y_axis_anchors:
+            logger.info("Y ticks from local OCR: %d anchors", len(y_axis_anchors))
+
     # If Y labels were unparseable (e.g. VLM read "%"), do a focused re-read
     # on a zoomed crop of the Y-axis strip.  Its values update the displayed
     # range, but without pixel boxes they are not calibration anchors.
@@ -277,6 +289,14 @@ async def extract_chart(
         if x_axis_anchors:
             x_labels = [anchor.label for anchor in x_axis_anchors]
             logger.info("X-axis focused OCR read: %d dated anchors", len(x_axis_anchors))
+
+    interpolated_x_axis = False
+    if not x_axis_anchors:
+        x_axis_anchors = _endpoint_x_axis_anchors(plot_area, x_labels)
+        if x_axis_anchors:
+            x_labels = [anchor.label for anchor in x_axis_anchors]
+            interpolated_x_axis = True
+            logger.info("X axis uses VLM-read endpoint dates for reviewable interpolation")
 
     # --- Step 5: Trace curves ---
     traced = trace_all_curves(
@@ -315,6 +335,8 @@ async def extract_chart(
         review_reasons.append("y_axis_unverified")
     if len(x_axis_anchors) < 2 or not x_labels:
         review_reasons.append("x_axis_unverified")
+    elif interpolated_x_axis:
+        review_reasons.append("x_axis_interpolated")
     if review_reasons:
         return ChartExtractResult(
             structure=structure,
@@ -382,11 +404,16 @@ def _plot_area_from_structure(
 
     height, width = img_bgr.shape[:2]
     left, top, right, bottom = structure.plot_bbox_1000
+    # VLM rectangles describe the drawable area semantically, but are coarse
+    # enough to clip the first/last observation on wide charts.  Keep a small
+    # image-relative safety margin before CV traces the exact pixels.
+    pad_x = round(width * 0.04)
+    pad_y = round(height * 0.04)
     vlm_area = PlotArea(
-        left=round(left * width / 1000),
-        top=round(top * height / 1000),
-        right=round(right * width / 1000),
-        bottom=round(bottom * height / 1000),
+        left=max(0, round(left * width / 1000) - pad_x),
+        top=max(0, round(top * height / 1000) - pad_y),
+        right=min(width, round(right * width / 1000) + pad_x),
+        bottom=min(height, round(bottom * height / 1000) + pad_y),
     )
     if vlm_area.right - vlm_area.left < width * 0.12 or vlm_area.bottom - vlm_area.top < height * 0.12:
         return None
@@ -406,6 +433,27 @@ def _build_axis_anchors(raw: list[dict] | None, axis: str) -> list[AxisAnchor]:
         )
         for a in raw
     ]
+
+
+def _endpoint_x_axis_anchors(plot_area: PlotArea, labels: list[str] | None) -> list[AxisAnchor]:
+    """Use two VLM-read endpoint dates when the chart has no vertical grid."""
+    if not labels or len(labels) < 2:
+        return []
+    if _date_label_span_days(labels) < 30:
+        return []
+    return [
+        AxisAnchor(axis="x", px=plot_area.left, value=0.0, label=labels[0]),
+        AxisAnchor(axis="x", px=plot_area.right, value=1.0, label=labels[-1]),
+    ]
+
+
+def _date_label_span_days(labels: list[str] | None) -> int:
+    if not labels or len(labels) < 2:
+        return 0
+    try:
+        return (datetime.fromisoformat(labels[-1]).date() - datetime.fromisoformat(labels[0]).date()).days
+    except ValueError:
+        return 0
 
 
 async def _read_y_axis_focused(
@@ -712,6 +760,16 @@ def _select_auto_crop_region(
     implementation chose the *widest* line-like candidate, which selected
     that header and made the VLM correctly report that it saw no curve.
     """
+    # A coloured page border often yields a convincing Hough rectangle at
+    # the top-left of a report.  It is document decoration, not a chart.
+    regions = [
+        region for region in regions
+        if not (
+            region.x <= page_width * 0.08
+            and region.y <= page_height * 0.08
+            and region.w >= page_width * 0.85
+        )
+    ]
     page_area = page_width * page_height
     interior = [region for region in regions if 0.05 < (region.w * region.h) / page_area < 0.8]
     if not interior:

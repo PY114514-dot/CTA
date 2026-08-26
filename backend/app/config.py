@@ -1,6 +1,8 @@
 """Application-wide configuration with safe development defaults."""
 
 import os
+import subprocess
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -11,6 +13,11 @@ DATA_DIRECTORY = PROJECT_ROOT / "data"
 UPLOAD_DIRECTORY = DATA_DIRECTORY / "uploads"
 EXTERNAL_FACTOR_LIBRARY_DIRECTORY = DATA_DIRECTORY / "external_factor_library"
 FOF_LIBRARY_DIRECTORY = DATA_DIRECTORY / "fof_library"
+ATTRIBUTION_FACTOR_CONTRACT_DIRECTORY = DATA_DIRECTORY / "attribution_factor_contracts"
+
+# Environment keys that hold credentials.  They are persisted to backend/.env
+# (gitignored) and must never be echoed by configuration endpoints.
+SECRET_ENVIRONMENT_KEYS = frozenset({"DASHSCOPE_API_KEY", "LLM_API_KEY"})
 
 
 def load_local_environment() -> None:
@@ -28,8 +35,47 @@ def load_local_environment() -> None:
             os.environ.setdefault(key, value.strip().strip('"').strip("'"))
 
 
+def _restrict_env_file_permissions(env_file: Path) -> None:
+    """Keep credential files readable only by the current user.
+
+    Windows inherits folder ACLs by default, which can leave backend/.env
+    readable by every local account.  Replace the inherited ACL with an
+    explicit grant for the current user (plus SYSTEM / Administrators so
+    backups and maintenance tooling keep working).  On POSIX systems a plain
+    0600 mode achieves the same.  Failures are non-fatal: the file remains
+    functional, just with default permissions.
+    """
+    try:
+        if sys.platform == "win32":
+            user = os.environ.get("USERNAME") or os.environ.get("USER", "")
+            if not user:
+                return
+            subprocess.run(
+                [
+                    "icacls", str(env_file),
+                    "/inheritance:r",
+                    "/grant:r", f"{user}:(R,W)",
+                    "/grant:r", "SYSTEM:F",
+                    "/grant:r", "BUILTIN\\Administrators:F",
+                ],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        else:
+            os.chmod(env_file, 0o600)
+    except (OSError, subprocess.SubprocessError):
+        # chmod / ACL failures should never break the settings write itself.
+        pass
+
+
 def persist_local_environment(values: Mapping[str, str]) -> None:
-    """Persist approved local settings without exposing them to version control."""
+    """Persist approved local settings without exposing them to version control.
+
+    Writes are atomic (temp file + replace) and reject key/value injection via
+    newlines or "=" inside keys.  Credential files are then restricted to the
+    current user where the platform supports it.
+    """
     if not values:
         return
     if any(not key or "=" in key or any(char in value for char in "\r\n") for key, value in values.items()):
@@ -50,6 +96,8 @@ def persist_local_environment(values: Mapping[str, str]) -> None:
     temporary_file = env_file.with_suffix(".tmp")
     temporary_file.write_text("\n".join(updated) + "\n", encoding="utf-8")
     temporary_file.replace(env_file)
+    if any(key in SECRET_ENVIRONMENT_KEYS for key in values):
+        _restrict_env_file_permissions(env_file)
 
 
 load_local_environment()

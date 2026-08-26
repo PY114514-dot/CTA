@@ -11,9 +11,12 @@ import {
   Drawer,
   Layout,
   Row,
+  Select,
   Space,
   Statistic,
+  Tabs,
   Typography,
+  message,
 } from "antd";
 import {
   analyzeNav,
@@ -21,6 +24,8 @@ import {
   sampleColorAtPixel,
   getVlmConfig,
   kbGetNavSeries,
+  kbGetProduct,
+  kbListProducts,
   kbListNavCandidates,
   kbGetReviewPage,
   kbGetSourcePreview,
@@ -41,6 +46,7 @@ import { ReportExtractionView } from "./components/display";
 import HistoryDrawer from "./components/HistoryDrawer";
 import type { HistoryRecord } from "./storage/historyStorage";
 import { StepSection } from "./components/StepSection";
+import { PanelErrorBoundary } from "./components/ErrorBoundary";
 import AnalysisPanel from "./AnalysisPanel";
 import FactorAttributionPanel from "./FactorAttributionPanel";
 import ExternalFactorLibraryPanel from "./ExternalFactorLibraryPanel";
@@ -61,8 +67,11 @@ import SettingsDrawer, {
   type ResearchDefaults,
 } from "./SettingsDrawer";
 import FactorLibraryDrawer from "./FactorLibraryDrawer";
-import ChartExtractDrawer from "./ChartExtractDrawer";
-import FofWorkbench from "./fof/FofWorkbench";
+import ChartExtractDrawer from "./components/chartExtract/ChartExtractDrawer";
+import FofWorkbench, { WorkbenchActionsContext, type WorkbenchActions } from "./fof/FofWorkbench";
+import InvestmentCommittee from "./fof/InvestmentCommittee";
+import ProductCompareDrawer from "./fof/ProductCompareDrawer";
+import ProductLibraryPanel, { type CalibrationQueueItem } from "./fof/ProductLibraryPanel";
 import { useImageDigitization } from "./hooks/useImageDigitization";
 import { useProductIdentity } from "./hooks/useProductIdentity";
 import { useHistory } from "./hooks/useHistory";
@@ -74,6 +83,7 @@ import ChartPreviewReview from "./components/nav/ChartPreviewReview";
 import { ImportWorkspaceOpenHeader } from "./components/nav/ImportWorkspaceIntro";
 import PerformanceResultCard from "./components/nav/PerformanceResultCard";
 import { autoFitCurveToSelectedLine } from "./utils/curveAutoFit";
+import type { CropRegion } from "./fof/MultiProductReviewModal";
 import "@fontsource/playfair-display/400.css";
 import "@fontsource/playfair-display/600.css";
 import "@fontsource/playfair-display/700.css";
@@ -82,11 +92,64 @@ import "@fontsource/source-sans-3/500.css";
 import "@fontsource/source-sans-3/600.css";
 import "@fontsource/ibm-plex-mono/400.css";
 import "@fontsource/ibm-plex-mono/500.css";
+import sourceSans400Woff2 from "@fontsource/source-sans-3/files/source-sans-3-latin-400-normal.woff2?url";
+import playfair400Woff2 from "@fontsource/playfair-display/files/playfair-display-latin-400-normal.woff2?url";
+import ibmPlexMono400Woff2 from "@fontsource/ibm-plex-mono/files/ibm-plex-mono-latin-400-normal.woff2?url";
 import "antd/dist/reset.css";
 import "./serif.css";
 
+function ProductLibraryPage({ mode }: { mode: "queue" | "catalog" }): React.JSX.Element {
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const toggleProduct = useCallback((productId: string) => {
+    setSelectedIds((current) => {
+      const selected = !current.includes(productId);
+      window.dispatchEvent(new CustomEvent("kb:toggle-product", { detail: { productId, selected } }));
+      return selected ? [...current, productId] : current.filter((id) => id !== productId);
+    });
+  }, []);
+
+  return <Content style={{ maxWidth: 1440, width: "100%", margin: "24px auto 48px", padding: "0 24px" }}>
+    <div style={{ marginBottom: 16 }}>
+      <Title level={4} style={{ fontFamily: FONT_DISPLAY, margin: 0, color: "var(--serif-foreground)" }}>{mode === "catalog" ? "产品列表" : "待处理"}</Title>
+      <span className="masthead-subtitle" style={{ color: "var(--serif-muted-foreground)" }}>{mode === "catalog" ? "浏览、搜索并选择已审核产品进入研究" : "处理资料绑定、产品确认和净值复核"}</span>
+    </div>
+    <Card size="small" style={{ minHeight: "calc(100vh - 180px)" }}>
+      <ProductLibraryPanel mode={mode} selectedIds={selectedIds} onToggleSelect={toggleProduct} />
+    </Card>
+  </Content>;
+}
+
+function AllocationLibraryPage(): React.JSX.Element {
+  return <Content style={{ maxWidth: 1440, width: "100%", margin: "24px auto 48px", padding: "0 24px" }}>
+    <div style={{ marginBottom: 16 }}>
+      <Title level={4} style={{ fontFamily: FONT_DISPLAY, margin: 0, color: "var(--serif-foreground)" }}>配置草案库</Title>
+      <span className="masthead-subtitle" style={{ color: "var(--serif-muted-foreground)" }}>集中查看配置约束、组合表现、审批状态、版本与后续跟踪</span>
+    </div>
+    <InvestmentCommittee />
+  </Content>;
+}
+
+// Preload the three body/display/mono fonts before first paint to avoid
+// FOIT/FOUT. Injected at module scope so the browser discovers the font
+// files before the CSSOM triggers the @font-face fetches.
+for (const fontUrl of [sourceSans400Woff2, playfair400Woff2, ibmPlexMono400Woff2]) {
+  const preloadLink = document.createElement("link");
+  preloadLink.rel = "preload";
+  preloadLink.as = "font";
+  preloadLink.type = "font/woff2";
+  preloadLink.crossOrigin = "anonymous";
+  preloadLink.href = fontUrl;
+  document.head.appendChild(preloadLink);
+}
+
 const { Content } = Layout;
 const { Paragraph, Title, Text } = Typography;
+type AppView = "workbench" | "catalog" | "library" | "allocations" | "review" | "tools";
+
+function initialAppView(): AppView {
+  const value = new URLSearchParams(window.location.search).get("view");
+  return value === "catalog" || value === "library" || value === "allocations" || value === "review" || value === "tools" ? value : "workbench";
+}
 
 /** Research starts empty: sample NAV must never be mistaken for product data. */
 const SAMPLE_NAV_TEXT = "";
@@ -180,16 +243,52 @@ function App(): React.JSX.Element {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [factorLibOpen, setFactorLibOpen] = useState(false);
   const [chartExtractOpen, setChartExtractOpen] = useState(false);
-  const [activeView, setActiveView] = useState<"workbench" | "tools">("workbench");
+  const [activeView, setActiveView] = useState<AppView>(initialAppView);
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (activeView === "workbench") url.searchParams.delete("view");
+    else url.searchParams.set("view", activeView);
+    window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+  }, [activeView]);
+  // 对比栏状态与「加入对话」的选中产品完全独立：上限两只，用于两两对比；
+  // 提升到 App 层让 FOF 工作台与产品库的「评分总览」共用同一对比栏。
+  const [compareOpen, setCompareOpen] = useState(false);
+  const [compareIds, setCompareIds] = useState<string[]>([]);
+  const [compareNames, setCompareNames] = useState<Record<string, string>>({});
+  const handleCompareChange = useCallback((ids: string[], names: Record<string, string>) => {
+    setCompareIds(ids);
+    setCompareNames((current) => ({ ...current, ...names }));
+  }, []);
+  const handleToggleCompare = useCallback((productId: string, name?: string) => {
+    if (name) setCompareNames((current) => ({ ...current, [productId]: name }));
+    setCompareIds((current) => {
+      if (current.includes(productId)) return current.filter((id) => id !== productId);
+      if (current.length >= 2) {
+        message.warning("对比最多支持两只产品，请先移出一只。");
+        return current;
+      }
+      return [...current, productId];
+    });
+  }, []);
+  const handleReplaceCompare = useCallback((ids: string[], names: Record<string, string>) => {
+    setCompareIds(ids.slice(0, 2));
+    setCompareNames(names);
+  }, []);
   const [calibratingProductId, setCalibratingProductId] = useState<string>();
+  const [calibratingProduct, setCalibratingProduct] = useState<KbProduct>();
   const [calibrationSourceFileId, setCalibrationSourceFileId] = useState<string>();
+  const [calibrationSourceFragmentId, setCalibrationSourceFragmentId] = useState<string>();
   const [calibrationSourcePage, setCalibrationSourcePage] = useState<number>();
   const [calibrationSourceIsPdf, setCalibrationSourceIsPdf] = useState(false);
+  const [calibrationQueue, setCalibrationQueue] = useState<CalibrationQueueItem[]>([]);
+  const [calibrationQueueIndex, setCalibrationQueueIndex] = useState(0);
   const [isSavingCalibration, setIsSavingCalibration] = useState(false);
   const [calibrationConflictReasons, setCalibrationConflictReasons] = useState<string[]>([]);
   const [manualConflictConfirmed, setManualConflictConfirmed] = useState(false);
   const [chartReviewReasons, setChartReviewReasons] = useState<string[]>([]);
   const [chartReviewConfirmed, setChartReviewConfirmed] = useState(false);
+  const [reviewTargetOpen, setReviewTargetOpen] = useState(false);
+  const [reviewTargets, setReviewTargets] = useState<KbProduct[]>([]);
   const accentPreset = useMemo(() => getPreset(accentKey), [accentKey]);
   const themeConfig = useMemo(() => buildSerifTheme(accentPreset), [accentPreset]);
 
@@ -369,7 +468,7 @@ function App(): React.JSX.Element {
     }
   }
 
-  const handleCalibrateProduct = useCallback(async (product: KbProduct, preferredSourceFileId?: string): Promise<void> => {
+  const handleCalibrateProduct = useCallback(async (product: KbProduct, preferredSourceFileId?: string, sourceRegion?: CropRegion, sourceFragmentId?: string): Promise<void> => {
     const requestId = ++calibrationRequestIdRef.current;
     ++smartExtractionRequestIdRef.current;
     ++calibrationSaveRequestIdRef.current;
@@ -381,12 +480,14 @@ function App(): React.JSX.Element {
     setIsPickingCurveColor(false);
     setIsCurveEditMode(false);
     setAutoFitMessage(undefined);
-    setActiveView("tools");
+    setActiveView("review");
     setWorkflowStep(0);
     setIsImportWorkspaceOpen(true);
     setCalibratingProductId(product.id);
+    setCalibratingProduct(product);
     setCalibrationSourcePage(undefined);
     setCalibrationSourceIsPdf(false);
+    setCalibrationSourceFragmentId(sourceFragmentId);
     setProductName(product.standard_name);
     setAnalysisResult(undefined);
     setAnalysisError(undefined);
@@ -452,6 +553,14 @@ function App(): React.JSX.Element {
         if (!selectImage(preview)) {
           throw new Error("来源资料已读取，但预览图格式不受支持");
         }
+        if (sourceRegion) {
+          applyLocatedChart({
+            startXRatio: sourceRegion.left_ratio,
+            endXRatio: sourceRegion.right_ratio,
+            topYRatio: sourceRegion.top_ratio,
+            bottomYRatio: sourceRegion.bottom_ratio,
+          });
+        }
         setCalibrationSourcePage(location.is_pdf ? pageNumber : undefined);
         setCalibrationSourceIsPdf(location.is_pdf);
         setImportMessage(
@@ -466,7 +575,7 @@ function App(): React.JSX.Element {
       setImportMessage(`已载入「${product.standard_name}」的候选净值；原图读取失败时请返回 FOF 工作台重新上传资料。`);
       setAnalysisError(error instanceof Error ? error.message : "读取待复核产品失败");
     }
-  }, [resetImage, selectImage, setImageError, setProductName]);
+  }, [applyLocatedChart, resetImage, selectImage, setImageError, setProductName]);
 
   const handleSaveCalibratedNav = useCallback(async (): Promise<void> => {
     if (!calibratingProductId) return;
@@ -497,14 +606,41 @@ function App(): React.JSX.Element {
       await kbReplaceNavSeries(productId, points, {
         frequency,
         sourceFileId: calibrationSourceFileId,
+        sourceFragmentId: calibrationSourceFragmentId,
       });
+      if (!isCurrentSave()) return;
+      const updatedProduct = await kbGetProduct(productId);
+      setCalibratingProduct(updatedProduct);
       if (!isCurrentSave()) return;
       const result = await analyzeNav(points, frequency, riskFreeRate);
       if (!isCurrentSave()) return;
-      setAnalysisResult(result);
-      setWorkflowStep(1);
+      setAnalysisResult(undefined);
+      setWorkflowStep(0);
       window.dispatchEvent(new Event("kb:product-updated"));
-      setImportMessage(`已确认并保存 ${points.length} 条净值；最大回撤 ${percentage(result.metrics.maximum_drawdown)}，现已进入研究。`);
+      window.dispatchEvent(new CustomEvent("kb:open-product", { detail: updatedProduct }));
+      const nextQueueItem = calibrationQueue[calibrationQueueIndex + 1];
+      if (nextQueueItem) {
+        setCalibrationQueueIndex((index) => index + 1);
+        setImportMessage(`已保存 ${points.length} 条净值，正在进入队列中的下一产品。`);
+        setAnalysisError(undefined);
+        await handleCalibrateProduct(
+          nextQueueItem.product,
+          nextQueueItem.sourceFileId,
+          nextQueueItem.sourceRegion,
+          nextQueueItem.sourceFragmentId,
+        );
+        return;
+      }
+      if (calibrationQueue.length) {
+        setCalibrationQueue([]);
+        setCalibrationQueueIndex(0);
+      }
+      setActiveView("workbench");
+      setImportMessage(
+        updatedProduct.research_workflow?.stage === "research_ready"
+          ? `已确认并保存 ${points.length} 条净值；最大回撤 ${percentage(result.metrics.maximum_drawdown)}，已打开产品画像。`
+          : `已保存 ${points.length} 条净值；正式研究仍需处理：${updatedProduct.research_workflow?.blocking_reasons[0] ?? "产品与净值复核"}。`,
+      );
       setAnalysisError(undefined);
     } catch (error) {
       if (!isCurrentSave()) return;
@@ -512,7 +648,58 @@ function App(): React.JSX.Element {
     } finally {
       if (isCurrentSave()) setIsSavingCalibration(false);
     }
-  }, [calibratingProductId, calibrationConflictReasons.length, calibrationSourceFileId, chartReviewConfirmed, chartReviewReasons.length, frequency, manualConflictConfirmed, navText, riskFreeRate]);
+  }, [calibratingProductId, calibrationConflictReasons.length, calibrationQueue, calibrationQueueIndex, calibrationSourceFileId, calibrationSourceFragmentId, chartReviewConfirmed, chartReviewReasons.length, frequency, handleCalibrateProduct, manualConflictConfirmed, navText, riskFreeRate]);
+
+  const handleStartCalibrationQueue = useCallback((items: CalibrationQueueItem[]) => {
+    const first = items.at(0);
+    if (!first) return;
+    setCalibrationQueue(items);
+    setCalibrationQueueIndex(0);
+    void handleCalibrateProduct(first.product, first.sourceFileId, first.sourceRegion, first.sourceFragmentId);
+  }, [handleCalibrateProduct]);
+
+  const workbenchActions = useMemo<WorkbenchActions>(() => ({
+    onFocusProduct: (product) => window.dispatchEvent(new CustomEvent("kb:focus-product", { detail: product })),
+    onOpenResearch: (product) => {
+      window.dispatchEvent(new CustomEvent("kb:open-product", { detail: product }));
+      setActiveView("workbench");
+    },
+    onOpenSelection: (productIds, panel) => {
+      window.dispatchEvent(new CustomEvent("kb:open-selection", { detail: { productIds, panel } }));
+      setActiveView("workbench");
+    },
+    onCalibrateProduct: handleCalibrateProduct,
+    onStartCalibrationQueue: handleStartCalibrationQueue,
+  }), [handleCalibrateProduct, handleStartCalibrationQueue]);
+
+  const exitReview = useCallback(() => {
+    ++calibrationRequestIdRef.current;
+    ++smartExtractionRequestIdRef.current;
+    ++calibrationSaveRequestIdRef.current;
+    setCalibrationQueue([]);
+    setCalibrationQueueIndex(0);
+    setIsSavingCalibration(false);
+    setActiveView("workbench");
+  }, []);
+
+  const skipCalibrationQueueItem = useCallback(() => {
+    const next = calibrationQueue[calibrationQueueIndex + 1];
+    if (!next) {
+      exitReview();
+      return;
+    }
+    setCalibrationQueueIndex((index) => index + 1);
+    void handleCalibrateProduct(next.product, next.sourceFileId, next.sourceRegion, next.sourceFragmentId);
+  }, [calibrationQueue, calibrationQueueIndex, exitReview, handleCalibrateProduct]);
+
+  const openReviewTargetPicker = useCallback(async () => {
+    try {
+      setReviewTargets((await kbListProducts({ limit: 1000 })).filter((product) => product.confirmation_status !== "rejected" && product.id !== calibratingProductId));
+      setReviewTargetOpen(true);
+    } catch {
+      setAnalysisError("无法加载产品列表，请返回产品列表后重试。");
+    }
+  }, [calibratingProductId]);
 
   async function handleImageImport(
     lineKind: "product" | "benchmark" = "product",
@@ -573,6 +760,12 @@ function App(): React.JSX.Element {
       original.src = imagePreviewUrl;
       await new Promise<void>((resolve, reject) => { original.onload = () => resolve(); original.onerror = () => reject(new Error("原图无法读取")); });
       if (requestId !== smartExtractionRequestIdRef.current) return;
+      const isCumulativeReturn = Boolean(
+        result.structure?.curves.some((curve) => /收益|回报|%|％/.test(String(curve.name ?? "")))
+        || result.structure?.y_ticks.some((label) => /%|％/.test(label))
+        || /收益|回报|%|％/.test(result.structure?.y_axis_label ?? ""),
+      );
+      handleImageValueModeChange(isCumulativeReturn ? "cumulative_return" : "nav");
       const [offsetX = 0, offsetY = 0] = result.crop_offset ?? [];
       const area = result.plot_area;
       if (area) {
@@ -644,7 +837,10 @@ function App(): React.JSX.Element {
       }));
       const extractedFrequency: DataFrequency = result.frequency === "daily" || result.frequency === "monthly" || result.frequency === "weekly"
         ? result.frequency : "weekly";
-      const text = formatNavText(valid.map((point) => ({ observation_date: point.date, net_asset_value: point.value! })));
+      const text = formatNavText(valid.map((point) => ({
+        observation_date: point.date,
+        net_asset_value: isCumulativeReturn ? 1 + point.value! : point.value!,
+      })));
       setNavText(text);
       setFrequency(extractedFrequency);
       setCandidateCurve(candidate);
@@ -655,9 +851,9 @@ function App(): React.JSX.Element {
       setIsCurveEditMode(false);
       setAnalysisResult(undefined);
       if (reviewRequired) {
-        setImportMessage(`${sourceLabel}${vlmLabel}CV 已在定位图框内追踪 ${valid.length} 个${extractedFrequency === "weekly" ? "周频" : extractedFrequency === "monthly" ? "月频" : "日频"}候选点；置信度 ${(result.confidence * 100).toFixed(0)}%。${reviewReasons.join("、")}。请先对照原图完成人工校准并确认，不能直接进入研究。`);
+        setImportMessage(`${sourceLabel}${vlmLabel}CV 已在定位图框内追踪 ${valid.length} 个${extractedFrequency === "weekly" ? "周频" : extractedFrequency === "monthly" ? "月频" : "日频"}候选点；${isCumulativeReturn ? "纵轴为累计收益率，已换算为标准化净值候选。" : "纵轴为单位净值。"}置信度 ${(result.confidence * 100).toFixed(0)}%。${reviewReasons.join("、")}。请先对照原图完成人工校准并确认，不能直接进入研究。`);
       } else {
-        setImportMessage(`${sourceLabel}${vlmLabel}CV 已在定位图框内追踪 ${valid.length} 个${extractedFrequency === "weekly" ? "周频" : extractedFrequency === "monthly" ? "月频" : "日频"}点；置信度 ${(result.confidence * 100).toFixed(0)}%。请直接核对虚线。`);
+        setImportMessage(`${sourceLabel}${vlmLabel}CV 已在定位图框内追踪 ${valid.length} 个${extractedFrequency === "weekly" ? "周频" : extractedFrequency === "monthly" ? "月频" : "日频"}点；${isCumulativeReturn ? "纵轴为累计收益率，已换算为标准化净值候选。" : "纵轴为单位净值。"}置信度 ${(result.confidence * 100).toFixed(0)}%。请直接核对虚线。`);
         const reviewBlockMessage = getReviewBlockMessage(
           calibrationConflictReasons,
           manualConflictConfirmed,
@@ -682,7 +878,7 @@ function App(): React.JSX.Element {
     } finally {
       if (requestId === smartExtractionRequestIdRef.current) setIsSmartDigitizing(false);
     }
-  }, [applyLocatedChart, calibrationConflictReasons, calibrationSourceIsPdf, calibrationSourcePage, imagePreviewUrl, manualConflictConfirmed, pendingImage, riskFreeRate, setImageEndDate, setImageStartDate]);
+  }, [applyLocatedChart, calibrationConflictReasons, calibrationSourceIsPdf, calibrationSourcePage, handleImageValueModeChange, imagePreviewUrl, manualConflictConfirmed, pendingImage, riskFreeRate, setImageEndDate, setImageStartDate]);
 
   const handleCalibrationImageClick = useCallback(async (event: React.MouseEvent<HTMLImageElement>): Promise<void> => {
     if (!isPickingCurveColor || !pendingImage) {
@@ -718,7 +914,8 @@ function App(): React.JSX.Element {
           return formatNavText(points.map((point, index) => {
             const constrainedY = Math.max(topYRatio!, Math.min(bottomYRatio!, nextCurve[index]!.y));
             const normalized = (bottomYRatio! - constrainedY) / (bottomYRatio! - topYRatio!);
-            return { ...point, net_asset_value: imageNavMin! + normalized * (imageNavMax! - imageNavMin!) };
+            const axisValue = imageNavMin! + normalized * (imageNavMax! - imageNavMin!);
+            return { ...point, net_asset_value: imageValueMode === "cumulative_return" ? 1 + axisValue / 100 : axisValue };
           }));
         } else {
           // Before axis calibration, retain the current NAV range and only
@@ -739,7 +936,7 @@ function App(): React.JSX.Element {
         return previous;
       }
     });
-  }, [bottomYRatio, candidateCurvePoints, imageNavMax, imageNavMin, topYRatio]);
+  }, [bottomYRatio, candidateCurvePoints, imageNavMax, imageNavMin, imageValueMode, topYRatio]);
 
   const handleCandidatePointMove = useCallback((index: number, yRatio: number): void => {
     const source = candidateCurvePoints;
@@ -828,7 +1025,7 @@ function App(): React.JSX.Element {
       sourceText,
       aiReport,
     });
-    setImportMessage("已保存到历史记录。");
+    setImportMessage("已保存到研究档案。");
   }
 
   async function handleViewHistory(record: HistoryRecord): Promise<void> {
@@ -857,6 +1054,7 @@ function App(): React.JSX.Element {
 
   return (
     <ConfigProvider theme={themeConfig}>
+      <WorkbenchActionsContext.Provider value={workbenchActions}>
       <Layout style={{ minHeight: "100vh" }}>
         {/* View toggle bar */}
         <div
@@ -885,13 +1083,17 @@ function App(): React.JSX.Element {
               >
                 FOF 工作台
               </Button>
+              <Button size="small" type={activeView === "catalog" ? "primary" : "text"} ghost={activeView === "catalog"} onClick={() => setActiveView("catalog")}>产品列表</Button>
+              <Button size="small" type={activeView === "library" ? "primary" : "text"} ghost={activeView === "library"} onClick={() => setActiveView("library")}>待处理</Button>
+              <Button size="small" type={activeView === "allocations" ? "primary" : "text"} ghost={activeView === "allocations"} onClick={() => setActiveView("allocations")}>配置草案</Button>
               <Button
                 size="small"
-                type={activeView === "tools" ? "primary" : "text"}
-                ghost={activeView === "tools"}
-                onClick={() => setActiveView("tools")}
+                type={activeView === "review" ? "primary" : "text"}
+                ghost={activeView === "review"}
+                disabled={!calibratingProduct}
+                onClick={() => setActiveView("review")}
               >
-                研究工具
+                产品复核
               </Button>
             </Space>
           </Space>
@@ -904,15 +1106,40 @@ function App(): React.JSX.Element {
             ] }}>
               <Button size="small">工具</Button>
             </Dropdown>
-            <Button size="small" onClick={() => setIsHistoryOpen(true)}>历史 {historyRecords.length}</Button>
+            <Button size="small" onClick={() => setIsHistoryOpen(true)}>研究档案 {historyRecords.length}</Button>
           </Space>
         </div>
 
-        {activeView === "workbench" ? (
-          <div style={{ flex: 1, width: "100%", minWidth: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
-            <FofWorkbench onCalibrateProduct={handleCalibrateProduct} />
-          </div>
-        ) : (
+        <div style={{ flex: 1, width: "100%", minWidth: 0, overflow: "hidden", display: activeView === "workbench" ? "flex" : "none", flexDirection: "column" }}>
+          <PanelErrorBoundary label="FOF 工作台">
+            <FofWorkbench
+              onCalibrateProduct={handleCalibrateProduct}
+              onStartCalibrationQueue={handleStartCalibrationQueue}
+              compareIds={compareIds}
+              compareNames={compareNames}
+              onCompareChange={handleCompareChange}
+              onToggleCompare={handleToggleCompare}
+              onOpenCompare={() => setCompareOpen(true)}
+              onOpenProductLibrary={() => setActiveView("catalog")}
+            />
+          </PanelErrorBoundary>
+        </div>
+        {activeView === "catalog" && (
+          <PanelErrorBoundary label="产品列表">
+            <ProductLibraryPage mode="catalog" />
+          </PanelErrorBoundary>
+        )}
+        {activeView === "library" && (
+          <PanelErrorBoundary label="待处理">
+            <ProductLibraryPage mode="queue" />
+          </PanelErrorBoundary>
+        )}
+        {activeView === "allocations" && (
+          <PanelErrorBoundary label="配置草案库">
+            <AllocationLibraryPage />
+          </PanelErrorBoundary>
+        )}
+        {activeView !== "workbench" && activeView !== "catalog" && activeView !== "library" && activeView !== "allocations" && (
         <Content style={{ maxWidth: 1240, width: "100%", margin: "32px auto 64px", padding: "0 24px" }}>
         <div
           style={{
@@ -932,10 +1159,10 @@ function App(): React.JSX.Element {
                 color: "var(--serif-foreground)",
               }}
             >
-              单产品研究
+              {activeView === "review" ? "产品复核" : "研究分析"}
             </Title>
             <span className="masthead-subtitle" style={{ color: "var(--serif-muted-foreground)" }}>
-              校准净值后，生成因子分析与研究报告
+              {activeView === "review" ? "核对来源、校准曲线并确认净值" : "只读使用已复核净值生成因子分析与研究报告"}
             </span>
           </div>
         </div>
@@ -944,8 +1171,21 @@ function App(): React.JSX.Element {
             <Space wrap size={12}>
               <Text strong>{productName || "尚未选择产品"}</Text>
               <Text type="secondary">{navCount} 个净值点</Text>
-              <Text type={analysisResult ? "success" : "warning"}>{analysisResult ? "已完成净值计算，可继续归因" : "净值待校验"}</Text>
-              {workflowStep > 0 && <Button size="small" onClick={() => setWorkflowStep(0)}>返回数据校准</Button>}
+              <Text type={calibratingProduct?.research_workflow?.stage === "research_ready" ? "success" : "warning"}>
+                {calibratingProduct?.research_workflow?.stage === "research_ready"
+                  ? "净值已通过研究门槛，可继续归因"
+                  : calibratingProduct
+                    ? `暂不能正式归因：${[...new Set([
+                      ...calibratingProduct.research_workflow?.blocking_reasons ?? [],
+                      ...calibratingProduct.nav_quality?.reasons ?? [],
+                    ])].join("；") || "请先完成产品与净值复核"}`
+                    : analysisResult ? "已完成本地净值计算；正式归因需在待处理中完成复核" : "净值待校验"}
+              </Text>
+              {activeView === "review" && workflowStep > 0 && <Button size="small" onClick={() => setWorkflowStep(0)}>继续复核净值</Button>}
+              {activeView === "tools" && calibratingProduct && <Button size="small" onClick={() => void handleCalibrateProduct(calibratingProduct)}>查看 / 修改复核净值</Button>}
+              {activeView === "review" && calibratingProduct && <Button size="small" onClick={() => void openReviewTargetPicker()}>更换产品</Button>}
+              {activeView === "review" && <Button size="small" onClick={exitReview}>退出复核</Button>}
+              {calibratingProduct && calibratingProduct.research_workflow?.stage !== "research_ready" && <Button size="small" onClick={() => setActiveView("library")}>返回待处理</Button>}
             </Space>
             {sourceText.trim() && (
               <details style={{ marginTop: 8 }}>
@@ -955,11 +1195,32 @@ function App(): React.JSX.Element {
             )}
           </div>
         </Card>
+        <Drawer
+          title="更换复核产品"
+          open={reviewTargetOpen}
+          onClose={() => setReviewTargetOpen(false)}
+          width={420}
+        >
+          <Paragraph type="secondary">切换只改变当前复核对象，不会删除原产品，也不会覆盖任何已审核净值。</Paragraph>
+          <Select
+            showSearch
+            optionFilterProp="label"
+            placeholder="选择要复核的产品"
+            style={{ width: "100%" }}
+            options={reviewTargets.map((product) => ({ value: product.id, label: product.standard_name }))}
+            onChange={(productId) => {
+              const target = reviewTargets.find((product) => product.id === productId);
+              if (!target) return;
+              setReviewTargetOpen(false);
+              void handleCalibrateProduct(target, calibrationSourceFileId);
+            }}
+          />
+        </Drawer>
         <Row gutter={[24, 24]}>
           {/* Left column: data ingestion and review */}
-          <Col xs={24} style={{ display: workflowStep === 0 ? "flex" : "none", flexDirection: "column" }}>
+          {activeView === "review" && <Col xs={24} style={{ display: workflowStep === 0 ? "flex" : "none", flexDirection: "column" }}>
             <Card
-              title="净值与资料"
+              title={activeView === "review" ? "复核净值与来源资料" : "净值与资料"}
               style={{ flex: 1 }}
               extra={
                 <Button size="small" onClick={clearAll}>
@@ -969,6 +1230,14 @@ function App(): React.JSX.Element {
             >
               <div style={{ display: isImportWorkspaceOpen ? "block" : "none" }}>
               <ImportWorkspaceOpenHeader />
+              {calibrationQueue.length > 0 && <Alert
+                type="info"
+                showIcon
+                style={{ marginBottom: 12 }}
+                message={`批量校准 ${calibrationQueueIndex + 1} / ${calibrationQueue.length} · ${calibratingProduct?.standard_name ?? "正在载入"}`}
+                description="保存当前经人工确认的净值后，会自动进入下一条；未保存不会跳过当前产品。"
+                action={<Space size={4}><Button size="small" onClick={skipCalibrationQueueItem}>跳过当前</Button><Button size="small" onClick={exitReview}>结束队列</Button></Space>}
+              />}
               <div style={{ marginBottom: 8 }}>
                 <StepSection step={1} title="上传净值资料" visible={workflowStep === 0}>
                   <Alert
@@ -980,6 +1249,7 @@ function App(): React.JSX.Element {
                   />
                 </StepSection>
 
+                <PanelErrorBoundary label="净值导入审核">
                 <NavImportReviewPanel
                   navText={navText}
                   onNavTextChange={(value) => {
@@ -1003,16 +1273,40 @@ function App(): React.JSX.Element {
                   onDismissAnalysisError={() => setAnalysisError(undefined)}
                   navCount={navCount}
                 />
+                </PanelErrorBoundary>
 
                 {pendingImage && <>
                   <Divider titlePlacement="left">图表识别与复核</Divider>
                   <ChartPreviewReview
-                    src={imagePreviewUrl}
-                    anchors={{ startXRatio, endXRatio, topYRatio, bottomYRatio }}
-                    candidateCurve={candidateCurvePoints}
-                    editable={isCurveEditMode}
-                    isPicking={isPickingCurveColor}
-                    onImageClick={(event) => void handleCalibrationImageClick(event)}
+                    canvas={{
+                      src: imagePreviewUrl,
+                      anchors: { startXRatio, endXRatio, topYRatio, bottomYRatio },
+                      candidateCurve: candidateCurvePoints,
+                      editable: isCurveEditMode,
+                      isPicking: isPickingCurveColor,
+                      onImageClick: (event) => void handleCalibrationImageClick(event),
+                      onPointMove: handleCandidatePointMove,
+                    }}
+                    zoom={{
+                      open: isZoomModalOpen,
+                      onOpen: () => { setZoomLevel(1); setIsZoomModalOpen(true); },
+                      onClose: () => { setIsZoomModalOpen(false); setActiveDateAnchor(undefined); },
+                      level: zoomLevel,
+                      onLevelChange: setZoomLevel,
+                    }}
+                    edit={{
+                      isAutoFitting: isAutoFittingCurve,
+                      onAutoFit: () => void handleAutoFitCurve(),
+                      onToggleEdit: () => setIsCurveEditMode((value) => !value),
+                      autoFitMessage,
+                      onDismissAutoFit: () => setAutoFitMessage(undefined),
+                    }}
+                    summary={{
+                      navCount,
+                      frequency,
+                      confidence: candidateConfidence,
+                      maximumDrawdown: candidateMaximumDrawdown === undefined ? undefined : percentage(candidateMaximumDrawdown),
+                    }}
                     activeAnchor={activeDateAnchor}
                     onActiveAnchorChange={setActiveDateAnchor}
                     onToggleColorPicker={() => {
@@ -1020,21 +1314,6 @@ function App(): React.JSX.Element {
                       setActiveDateAnchor(undefined);
                     }}
                     canMark={Boolean(pendingImage)}
-                    zoomOpen={isZoomModalOpen}
-                    onZoomOpen={() => { setZoomLevel(1); setIsZoomModalOpen(true); }}
-                    onZoomClose={() => { setIsZoomModalOpen(false); setActiveDateAnchor(undefined); }}
-                    zoomLevel={zoomLevel}
-                    onZoomLevelChange={setZoomLevel}
-                    onPointMove={handleCandidatePointMove}
-                    navCount={navCount}
-                    frequency={frequency}
-                    confidence={candidateConfidence}
-                    maximumDrawdown={candidateMaximumDrawdown === undefined ? undefined : percentage(candidateMaximumDrawdown)}
-                    isAutoFitting={isAutoFittingCurve}
-                    onAutoFit={() => void handleAutoFitCurve()}
-                    onToggleEdit={() => setIsCurveEditMode((value) => !value)}
-                    autoFitMessage={autoFitMessage}
-                    onDismissAutoFit={() => setAutoFitMessage(undefined)}
                     showModal
                   />
 
@@ -1042,6 +1321,8 @@ function App(): React.JSX.Element {
                   visible={workflowStep === 0 && isCurveEditMode}
                   valueMode={imageValueMode}
                   onValueModeChange={handleImageValueModeChange}
+                  imageExtractionFrequency={imageExtractionFrequency}
+                  onImageExtractionFrequencyChange={setImageExtractionFrequency}
                   activeAnchor={activeDateAnchor}
                   onActiveAnchorChange={setActiveDateAnchor}
                   canMark={Boolean(pendingImage)}
@@ -1080,8 +1361,6 @@ function App(): React.JSX.Element {
                     }}
                     reportedCumulativeReturn={reportedCumulativeReturn}
                     onReportedCumulativeReturnChange={setReportedCumulativeReturn}
-                    imageExtractionFrequency={imageExtractionFrequency}
-                    onImageExtractionFrequencyChange={setImageExtractionFrequency}
                     onSmartExtract={() => void handleSmartImageImport()}
                     onOpenAdvancedCalibration={() => setIsCurveEditMode(true)}
                     productName={productName}
@@ -1094,7 +1373,7 @@ function App(): React.JSX.Element {
               </div>
               </div>
             </Card>
-          </Col>
+          </Col>}
 
           {/* Results */}
           <Col xs={24} lg={24} style={{ display: workflowStep === 1 ? "flex" : "none", flexDirection: "column" }}>
@@ -1103,25 +1382,48 @@ function App(): React.JSX.Element {
               error={analysisError}
               disclosedDifference={disclosedDifference}
               benchmarkReturn={benchmarkCumulativeReturn}
+              disclosure={calibratingProduct?.nav_quality}
               onExport={() => { if (analysisResult) void exportNavXlsx(navText, analysisResult.metrics, productName); }}
               onSaveHistory={handleSaveHistory}
             />
           </Col>
+
+          {activeView === "tools" && workflowStep === 0 && <Col xs={24}>
+            <Alert
+              type="info"
+              showIcon
+              message="研究分析只读使用已复核净值"
+              description={calibratingProduct
+                ? `当前为「${calibratingProduct.standard_name}」的研究结果。若要核对来源、曲线或修改净值，请进入产品复核；修改并保存后，研究分析会基于新净值重新计算。`
+                : "请先从 FOF 工作台选择一个已复核产品，再查看研究分析。"}
+              action={calibratingProduct
+                ? <Button size="small" type="primary" onClick={() => void handleCalibrateProduct(calibratingProduct)}>进入产品复核</Button>
+                : <Button size="small" type="primary" onClick={() => setActiveView("workbench")}>前往 FOF 工作台</Button>}
+            />
+          </Col>}
         </Row>
 
         {/* AI Strategy Attribution Analysis */}
-        {workflowStep === 1 && <AnalysisPanel navPoints={parsedNavPoints} frequency={frequency} productName={productName} strategyHint={sourceText} qualityOverrideConfirmed={manualConflictConfirmed} engineConfig={engineConfig} initialReport={aiReport} onReport={setAiReport} />}
+        {workflowStep === 1 && <PanelErrorBoundary label="分析面板"><AnalysisPanel navPoints={parsedNavPoints} frequency={frequency} productName={productName} strategyHint={sourceText} qualityOverrideConfirmed={manualConflictConfirmed} engineConfig={engineConfig} initialReport={aiReport} onReport={setAiReport} /></PanelErrorBoundary>}
 
         {/* Quantitative Factor Attribution (L1) */}
         {workflowStep === 2 && <>
-          <FactorAttributionPanel navPoints={parsedNavPoints} frequency={frequency} />
-          <ExternalFactorLibraryPanel />
+          <PanelErrorBoundary label="因子归因"><FactorAttributionPanel navPoints={parsedNavPoints} frequency={frequency} /></PanelErrorBoundary>
+          <PanelErrorBoundary label="外部因子库"><ExternalFactorLibraryPanel /></PanelErrorBoundary>
         </>}
 
       </Content>
         )}
 
         {/* Drawers accessible from both views */}
+        <ProductCompareDrawer
+          open={compareOpen}
+          productIds={compareIds}
+          onClose={() => setCompareOpen(false)}
+          onToggleProduct={handleToggleCompare}
+          onReplaceCompare={handleReplaceCompare}
+        />
+
         <HistoryDrawer
           open={isHistoryOpen}
           onClose={() => setIsHistoryOpen(false)}
@@ -1150,6 +1452,7 @@ function App(): React.JSX.Element {
           onClearHistory={handleClearAllHistory}
         />
     </Layout>
+      </WorkbenchActionsContext.Provider>
     </ConfigProvider>
   );
 }

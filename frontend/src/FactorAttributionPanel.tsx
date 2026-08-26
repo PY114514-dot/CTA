@@ -113,7 +113,7 @@ function RollingR2Chart({ snapshots }: { snapshots: FactorAttributionResponse["r
     },
     yAxis: [
       { type: "value" as const, name: "R²", min: 0, max: 1, position: "left" as const },
-      { type: "value" as const, name: "Beta", position: "right" as const },
+      { type: "value" as const, name: "关联系数", position: "right" as const },
     ],
     series: [
       {
@@ -255,7 +255,7 @@ export default function FactorAttributionPanel({ navPoints, frequency }: FactorA
         <div style={{ textAlign: "center", padding: "32px 0" }}>
           <Progress type="circle" percent={99.9} status="active" size={64} />
           <Paragraph type="secondary" style={{ marginTop: 16 }}>
-            正在对齐产品净值与因子收益序列，执行 HAC 回归 + 区块 Bootstrap + 滚动回归…
+            正在对齐产品净值与因子收益序列，计算统计关联、置信区间和分窗口变化…
           </Paragraph>
         </div>
       )}
@@ -323,7 +323,7 @@ export default function FactorAttributionPanel({ navPoints, frequency }: FactorA
             <Descriptions.Item label="样本外跟踪误差">
               {result.out_of_sample.tracking_error_annual === null ? "—" : `${(result.out_of_sample.tracking_error_annual * 100).toFixed(2)}%`}
             </Descriptions.Item>
-            <Descriptions.Item label="联合 HAC p值">
+            <Descriptions.Item label="整体显著性 p 值">
               {result.joint_hac.p_value === null ? "—" : result.joint_hac.p_value < 0.001 ? "<0.001" : result.joint_hac.p_value.toFixed(4)}
             </Descriptions.Item>
             <Descriptions.Item label="因子条件数">
@@ -339,7 +339,7 @@ export default function FactorAttributionPanel({ navPoints, frequency }: FactorA
               showIcon
               style={{ marginBottom: 16 }}
               message="因子共线性提示"
-              description={`高相关因子对：${result.collinearity.high_correlation_pairs.join("；")}。单个 Beta 不宜过度解读，应结合经济因子组贡献。`}
+              description={`高相关因子对：${result.collinearity.high_correlation_pairs.join("；")}。单个关联系数不宜过度解读，应结合因子组贡献。`}
             />
           )}
 
@@ -347,7 +347,7 @@ export default function FactorAttributionPanel({ navPoints, frequency }: FactorA
             type={result.diagnostics.residual_autocorrelation_detected || result.diagnostics.non_normality_detected ? "warning" : "info"}
             showIcon
             style={{ marginBottom: 16 }}
-            message={`统计口径：${result.inference_method}；HAC 最大滞后 ${result.hac_max_lags ?? "—"}`}
+              message={`统计检验：${result.inference_method}；最大滞后期数 ${result.hac_max_lags ?? "—"}`}
             description={
               <Space direction="vertical" size={2}>
                 <span>
@@ -383,8 +383,8 @@ export default function FactorAttributionPanel({ navPoints, frequency }: FactorA
                     ),
                   },
                   { title: "组别", dataIndex: "factor_group", width: 92 },
-                  { title: "Beta", dataIndex: "beta", width: 70, render: (v: number) => v.toFixed(4) },
-                  { title: "HAC SE", dataIndex: "std_error", width: 78, render: (v: number) => v.toFixed(4) },
+                  { title: "关联系数", dataIndex: "beta", width: 86, render: (v: number) => v.toFixed(4) },
+                  { title: "统计误差", dataIndex: "std_error", width: 78, render: (v: number) => v.toFixed(4) },
                   { title: "t 值", dataIndex: "t_stat", width: 60, render: (v: number) => (
                     <Text strong={Math.abs(v) > 2} type={Math.abs(v) > 2 ? undefined : "secondary"}>{v.toFixed(2)}</Text>
                   )},
@@ -393,7 +393,7 @@ export default function FactorAttributionPanel({ navPoints, frequency }: FactorA
                     <Text style={{ color: v >= 0 ? "#3f8600" : "#cf1322" }}>{v.toFixed(1)}%</Text>
                   )},
                   {
-                    title: "Euler风险贡献",
+                    title: "统计风险贡献",
                     width: 104,
                     render: (_: unknown, record) => {
                       const value = result.factor_risk_contributions[record.name];
@@ -414,7 +414,7 @@ export default function FactorAttributionPanel({ navPoints, frequency }: FactorA
                 showIcon
                 style={{ marginTop: 10 }}
                 message="三类输出不可互相替代"
-                description="Beta 是统计暴露；收益贡献是 beta × 因子平均收益相对产品平均收益的解释比例；Euler 风险贡献来自因子协方差。三者均不代表真实持仓或真实 P&L。"
+                description="关联系数衡量产品收益与因子收益的统计关系；收益贡献是关联系数 × 因子平均收益相对产品平均收益的解释比例；统计风险贡献来自因子协方差。三者均不代表真实持仓或实际盈亏。"
               />
               {result.lasso_selected.length > 0 && (
                 <div style={{ marginTop: 8 }}>
@@ -452,21 +452,21 @@ export default function FactorAttributionPanel({ navPoints, frequency }: FactorA
 
           {/* Residual diagnostics */}
           <Descriptions size="small" column={{ xs: 2, sm: 4 }} bordered style={{ marginBottom: 16 }}>
-            <Descriptions.Item label="Alpha HAC p值">{result.alpha_p_value < 0.001 ? "<0.001" : result.alpha_p_value.toFixed(4)}</Descriptions.Item>
-            <Descriptions.Item label="Alpha Bootstrap 95% CI">
+            <Descriptions.Item label="未解释收益显著性 p 值">{result.alpha_p_value < 0.001 ? "<0.001" : result.alpha_p_value.toFixed(4)}</Descriptions.Item>
+            <Descriptions.Item label="未解释收益 95% 区间">
               {result.annualized_alpha_bootstrap_ci_low === null || result.annualized_alpha_bootstrap_ci_high === null
                 ? "—"
                 : `[${(result.annualized_alpha_bootstrap_ci_low * 100).toFixed(2)}%, ${(result.annualized_alpha_bootstrap_ci_high * 100).toFixed(2)}%]`}
             </Descriptions.Item>
-            <Descriptions.Item label="联合 HAC 统计量">{result.joint_hac.statistic === null ? "—" : result.joint_hac.statistic.toFixed(2)}</Descriptions.Item>
-            <Descriptions.Item label="联合 HAC p值">{result.joint_hac.p_value === null ? "—" : result.joint_hac.p_value < 0.001 ? "<0.001" : result.joint_hac.p_value.toFixed(4)}</Descriptions.Item>
+            <Descriptions.Item label="整体检验统计量">{result.joint_hac.statistic === null ? "—" : result.joint_hac.statistic.toFixed(2)}</Descriptions.Item>
+            <Descriptions.Item label="整体显著性 p 值">{result.joint_hac.p_value === null ? "—" : result.joint_hac.p_value < 0.001 ? "<0.001" : result.joint_hac.p_value.toFixed(4)}</Descriptions.Item>
             <Descriptions.Item label="残差偏度">{result.residual.skewness.toFixed(3)}</Descriptions.Item>
             <Descriptions.Item label="残差峰度">{result.residual.kurtosis.toFixed(3)}</Descriptions.Item>
           </Descriptions>
 
           <Card size="small" title="L1 公开因子 vs L4 周报披露校验" style={{ marginBottom: 16 }}>
             <Paragraph type="secondary" style={{ fontSize: 12 }}>
-              上传管理人周报后，系统以“回归 Beta × 同期公开因子收益”与周报因子贡献比较；不会将 Beta 直接和单期 PnL 相比。
+              上传管理人周报后，系统以“回归关联系数 × 同期公开因子收益”与周报因子贡献比较；不会将关联系数直接和单期盈亏相比。
             </Paragraph>
             <Space wrap>
               <Upload accept="application/pdf,image/png,image/jpeg" showUploadList={false} beforeUpload={(file) => { void handleReportUpload(file); return false; }}>
@@ -490,7 +490,7 @@ export default function FactorAttributionPanel({ navPoints, frequency }: FactorA
                   dataSource={validation.factor_comparisons}
                   columns={[
                     { title: "因子", dataIndex: "display_name" },
-                    { title: "Beta", dataIndex: "l1_beta", render: (value: number) => value.toFixed(3) },
+                    { title: "关联系数", dataIndex: "l1_beta", render: (value: number) => value.toFixed(3) },
                     { title: "公开因子同期收益", dataIndex: "l1_factor_period_return", render: (value: number | null) => value === null ? "—" : `${(value * 100).toFixed(2)}%` },
                     { title: "L1 预测贡献", dataIndex: "l1_predicted_contribution", render: (value: number | null) => value === null ? "—" : `${(value * 100).toFixed(2)}%` },
                     { title: "周报披露贡献", dataIndex: "l4_contribution", render: (value: number) => `${(value * 100).toFixed(2)}%` },

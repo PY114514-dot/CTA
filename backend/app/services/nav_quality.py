@@ -8,17 +8,31 @@ research.  This module intentionally returns explanations rather than silently
 
 from __future__ import annotations
 
+import math
 from datetime import date
 from statistics import median
 from typing import Any, Iterable
 
 
+def _finite_positive_navs(points: Iterable[Any]) -> list[float]:
+    """Extract finite, strictly positive NAV values, ignoring bad cells."""
+    values: list[float] = []
+    for item in points:
+        try:
+            nav = float(item.nav)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(nav) and nav > 0:
+            values.append(nav)
+    return values
+
+
 def assess_nav_quality(observations: Iterable[Any], facts: Iterable[Any]) -> dict[str, Any]:
     points = sorted(observations, key=lambda item: item.observation_date)
-    values = [float(item.nav) for item in points if item.nav is not None and float(item.nav) > 0]
+    values = _finite_positive_navs(points)
     disclosed: dict[str, float] = {}
     for fact in facts:
-        if getattr(fact, "field_name", "") not in {"disclosed_cumulative_return", "disclosed_maximum_drawdown"}:
+        if getattr(fact, "field_name", "") not in {"disclosed_cumulative_return", "disclosed_annualized_return", "disclosed_maximum_drawdown", "disclosed_sharpe_ratio"}:
             continue
         try:
             disclosed[fact.field_name] = float(fact.field_value)
@@ -33,7 +47,9 @@ def assess_nav_quality(observations: Iterable[Any], facts: Iterable[Any]) -> dic
         "computed_maximum_drawdown": None,
         "largest_period_change": None,
         "disclosed_cumulative_return": disclosed.get("disclosed_cumulative_return"),
+        "disclosed_annualized_return": disclosed.get("disclosed_annualized_return"),
         "disclosed_maximum_drawdown": disclosed.get("disclosed_maximum_drawdown"),
+        "disclosed_sharpe_ratio": disclosed.get("disclosed_sharpe_ratio"),
     }
     if len(values) < 2:
         return result
@@ -59,9 +75,14 @@ def assess_nav_quality(observations: Iterable[Any], facts: Iterable[Any]) -> dic
     disclosed_drawdown = result["disclosed_maximum_drawdown"]
     if disclosed_drawdown is not None and abs(maximum_drawdown - disclosed_drawdown) > 0.05:
         reasons.append("曲线最大回撤与材料披露值相差超过 5 个百分点")
-    # A very large one-period move is not proof of an error, but it must be
-    # shown to the reviewer before using an image-derived series for research.
-    if abs(result["largest_period_change"]) > 0.08:
+    # A large move in a manually reviewed monthly series can be a real CTA
+    # return. The 8% check is for unreviewed or non-monthly image traces.
+    reviewed_monthly = points and all(
+        getattr(point, "frequency", None) == "monthly"
+        and getattr(point, "review_status", None) == "reviewed"
+        for point in points
+    )
+    if abs(result["largest_period_change"]) > 0.08 and not reviewed_monthly:
         reasons.append("存在超过 8% 的单期净值跳变，请在原图上核对该点")
 
     if reasons:
@@ -94,7 +115,9 @@ def assess_machine_nav_review(
     elif source_confidence < 0.85:
         reasons.append(f"CV/VLM 提取置信度仅 {source_confidence:.0%}，低于机器复核阈值 85%")
 
-    values = [float(item.nav) for item in points if item.nav is not None and float(item.nav) > 0]
+    values = _finite_positive_navs(points)
+    if len(values) != len(points):
+        reasons.append(f"{len(points) - len(values)} 个净值点为非数值或非正值，已从计算中剔除")
     # A perfectly flat or nearly flat image-derived curve is usually a failed
     # colour trace (for example, a grid line or chart border), not evidence
     # that a fund had exactly zero movement for dozens of observations.

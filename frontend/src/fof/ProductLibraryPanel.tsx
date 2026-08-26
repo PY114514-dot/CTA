@@ -1,60 +1,64 @@
-/** Left panel: batch upload queue + product library with confirmation workflow. */
+/** Left panel: product library with a compact material intake entry. */
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
-  Badge,
   Button,
   Card,
-  Checkbox,
   Dropdown,
   Empty,
   Form,
   Input,
   List,
   Modal,
-  Progress,
   Segmented,
   Select,
   Space,
   Tag,
-  Tooltip,
   Typography,
-  Upload,
   message,
 } from "antd";
 import {
-  DeleteOutlined,
-  EditOutlined,
-  FileOutlined,
-  InboxOutlined,
-  LinkOutlined,
   MoreOutlined,
   ReloadOutlined,
   SearchOutlined,
-  UploadOutlined,
 } from "@ant-design/icons";
 import {
   kbConfirmProduct,
   kbBindFile,
   kbBindFileCurves,
+  kbCreateProduct,
   kbDeleteFile,
   kbDeleteProduct,
+  kbGetIngestionQueue,
+  kbGetProduct,
   kbListFiles,
   kbListProducts,
   kbMachineReviewProducts,
   kbRejectProduct,
   kbReparseFile,
   kbUpdateProduct,
+  kbUpdateFileMaterialNature,
   kbUploadFile,
+  kbImportFuturesWeeklySqlite,
+  type IngestionQueueSnapshot,
   type KbFile,
   type KbProduct,
 } from "../api";
-import { hasTraceableSource, isDemoFileName, isDemoProduct, needsManualNaming, strategyLabel } from "./productDisplay";
+import { hasTraceableSource, isDemoFileName, isDemoProduct, needsManualNaming } from "./productDisplay";
+import {
+  findNextProductReviewFile,
+  isBulkNavDataset,
+  isProductReviewFile,
+  isResearchReady,
+  needsProductBinding,
+  productWorkflowAction,
+} from "./productWorkflow";
+import MaterialUploadCard from "./MaterialUploadCard";
+import ProductLibraryItem from "./ProductLibraryItem";
+import MultiProductReviewModal, { type CropRegion, type CurveReviewChoice } from "./MultiProductReviewModal";
+import { useWorkbenchActions } from "./FofWorkbench";
 
 const { Text } = Typography;
-const { Dragger } = Upload;
-
-type ResearchFilter = "all" | "actionable" | "ready";
 
 type UploadBatch = {
   total: number;
@@ -64,39 +68,115 @@ type UploadBatch = {
   fileIds: string[];
 };
 
-const PARSING_TAG: Record<string, { color: string; label: string }> = {
-  pending: { color: "default", label: "待解析" },
-  processing: { color: "processing", label: "解析中" },
-  completed: { color: "success", label: "解析完成" },
-  completed_no_nav: { color: "warning", label: "待校准曲线" },
-  failed: { color: "error", label: "失败" },
-};
+/** One pending workbench item, shared by the next-task button and its label.
+ *
+ * The button label and the click behaviour used to be computed by two
+ * different rule sets, so the label could promise one task while the click
+ * opened another.  ``decideNextTask`` is the single source of truth for both.
+ */
+type NextTaskDecision =
+  | { kind: "review"; label: string; file: KbFile }
+  | { kind: "bind"; label: string; file: KbFile }
+  | { kind: "curves"; label: string; file: KbFile }
+  | { kind: "recover"; label: string; file: KbFile }
+  | { kind: "reparse"; label: string; file: KbFile }
+  | { kind: "product"; label: string; product: KbProduct }
+  | { kind: "waiting"; label: string; waitingCount: number }
+  | { kind: "idle"; label: string };
 
-/** Product-library lanes describe data readiness, never expected performance. */
-interface Props {
-  refreshKey?: number;
-  selectedIds: string[];
-  onToggleSelect: (id: string) => void;
-  onFocusProduct: (product: KbProduct) => void;
-  onCalibrateProduct: (product: KbProduct, sourceFileId?: string) => void;
+/** True once a file has finished parsing (or failed), so binding never opens
+ * for a half-parsed file whose product identity has not been extracted yet. */
+function isTerminalFile(file: KbFile): boolean {
+  return file.parsing_status !== "pending" && file.parsing_status !== "processing";
 }
 
-export default function ProductLibraryPanel({ refreshKey = 0, selectedIds, onToggleSelect, onFocusProduct, onCalibrateProduct }: Props): React.JSX.Element {
+function decideNextTask(
+  queueFiles: KbFile[],
+  visibleProducts: KbProduct[],
+  excludedIds: ReadonlySet<string>,
+  preferredIds: readonly string[] | undefined,
+  productLabel: (product: KbProduct) => string | null,
+): NextTaskDecision {
+  const inFlightCount = queueFiles.filter((file) => !isTerminalFile(file)).length;
+  const reviewFile = findNextProductReviewFile(queueFiles, excludedIds, preferredIds);
+  if (reviewFile) {
+    return { kind: "review", label: `复核「${reviewFile.linked_product_names?.[0] ?? reviewFile.filename}」`, file: reviewFile };
+  }
+  const bindFile = queueFiles.find((file) => (
+    !excludedIds.has(file.id)
+    && needsProductBinding(file)
+    && isTerminalFile(file)
+    && file.parsing_status !== "failed"
+  ));
+  if (bindFile) return { kind: "bind", label: `绑定「${bindFile.filename}」`, file: bindFile };
+  const curveFile = queueFiles.find((file) => !excludedIds.has(file.id) && (file.unbound_curve_count ?? 0) > 0);
+  if (curveFile) return { kind: "curves", label: `确认曲线归属 · ${curveFile.filename}`, file: curveFile };
+  const recoverFile = queueFiles.find((file) => (
+    file.workflow?.next_action === "recover_chart_calibration" || file.parsing_status === "completed_no_nav"
+  ));
+  if (recoverFile) {
+    return { kind: "recover", label: `校准「${recoverFile.linked_product_names?.[0] ?? recoverFile.filename}」`, file: recoverFile };
+  }
+  const failedFile = queueFiles.find((file) => file.parsing_status === "failed");
+  if (failedFile) return { kind: "reparse", label: `重试「${failedFile.filename}」`, file: failedFile };
+  const nextProduct = visibleProducts.find((product) => !isResearchReady(product) && product.confirmation_status !== "rejected");
+  if (nextProduct) {
+    const label = productLabel(nextProduct);
+    if (label) return { kind: "product", label, product: nextProduct };
+  }
+  if (inFlightCount > 0) return { kind: "waiting", label: `等待解析 ${inFlightCount} 份`, waitingCount: inFlightCount };
+  return { kind: "idle", label: "处理下一项" };
+}
+
+export type CalibrationQueueItem = {
+  product: KbProduct;
+  sourceFileId: string;
+  sourceRegion: CropRegion;
+  sourceFragmentId: string;
+};
+
+/** Product-library lanes describe data readiness, never expected performance.
+ *
+ * Workbench-level callbacks (focus / research / calibrate / queue) are no
+ * longer drilled through this panel: they are provided by the
+ * WorkbenchActionsContext owned by FofWorkbench and consumed directly here
+ * and inside ProductLibraryItem.
+ */
+interface Props {
+  refreshKey?: number;
+  mode?: "queue" | "catalog";
+  selectedIds: string[];
+  onToggleSelect: (id: string) => void;
+}
+
+export default function ProductLibraryPanel({ refreshKey = 0, mode = "queue", selectedIds, onToggleSelect }: Props): React.JSX.Element {
+  const { onCalibrateProduct, onOpenSelection, onStartCalibrationQueue } = useWorkbenchActions();
   const [products, setProducts] = useState<KbProduct[]>([]);
   const [files, setFiles] = useState<KbFile[]>([]);
-  const [researchFilter, setResearchFilter] = useState<ResearchFilter>("all");
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [sortBy, setSortBy] = useState<"recent" | "name" | "status">("recent");
+  const [strategyFilter, setStrategyFilter] = useState<string>();
+  const [frequencyFilter, setFrequencyFilter] = useState<string>();
+  const [managerFilter, setManagerFilter] = useState<string>();
   const [loading, setLoading] = useState(false);
   const [uploadCount, setUploadCount] = useState(0);
   const [uploadBatch, setUploadBatch] = useState<UploadBatch | null>(null);
   const [uploadExpanded, setUploadExpanded] = useState(true);
+  const [uploadMaterialNature, setUploadMaterialNature] = useState<string>();
+  const [sqliteImporting, setSqliteImporting] = useState(false);
   const stagedUploadsRef = useRef<File[]>([]);
   const uploadStartTimerRef = useRef<number | null>(null);
   const refreshRequestIdRef = useRef(0);
   const listRef = useRef<HTMLDivElement>(null);
   const initialLoadDone = useRef(false);
+  const activeReviewFileIdRef = useRef<string | undefined>(undefined);
+  const resumeCurveReviewFileIdRef = useRef<string | undefined>(undefined);
+  const resumeCurveReviewAfterSaveFileIdRef = useRef<string | undefined>(undefined);
+  const openingReviewFileIdRef = useRef<string | undefined>(undefined);
+  const startedReviewFileIdsRef = useRef(new Set<string>());
+  const completedReviewFileIdsRef = useRef(new Set<string>());
+  const [autoAdvanceRequest, setAutoAdvanceRequest] = useState(0);
   const [editingProduct, setEditingProduct] = useState<KbProduct | null>(null);
   const [confirmAfterEdit, setConfirmAfterEdit] = useState(false);
   const [editForm] = Form.useForm();
@@ -104,9 +184,9 @@ export default function ProductLibraryPanel({ refreshKey = 0, selectedIds, onTog
   const [bindingMode, setBindingMode] = useState<"existing" | "new">("existing");
   const [bindingSubmitting, setBindingSubmitting] = useState(false);
   const [curveBindingFile, setCurveBindingFile] = useState<KbFile | null>(null);
-  const [curveBindingValues, setCurveBindingValues] = useState<Record<string, string>>({});
   const [machineReviewing, setMachineReviewing] = useState(false);
   const [bindingForm] = Form.useForm();
+  const [ingestionQueue, setIngestionQueue] = useState<IngestionQueueSnapshot | null>(null);
 
   // Debounce search input (300ms)
   useEffect(() => {
@@ -118,9 +198,12 @@ export default function ProductLibraryPanel({ refreshKey = 0, selectedIds, onTog
     const requestId = ++refreshRequestIdRef.current;
     setLoading(true);
     try {
-      const params: { search?: string } = {};
+      const params: { search?: string; limit: number } = { limit: 50 };
       if (debouncedSearch.trim()) params.search = debouncedSearch.trim();
-      const [productList, fileList] = await Promise.all([kbListProducts(params), kbListFiles()]);
+      const [productList, fileList] = await Promise.all([
+        kbListProducts(params),
+        mode === "queue" ? kbListFiles({ pendingOnly: true }) : Promise.resolve([] as KbFile[]),
+      ]);
       if (requestId !== refreshRequestIdRef.current) return;
       setProducts(productList);
       setFiles(fileList);
@@ -134,7 +217,20 @@ export default function ProductLibraryPanel({ refreshKey = 0, selectedIds, onTog
     } finally {
       if (requestId === refreshRequestIdRef.current) setLoading(false);
     }
-  }, [debouncedSearch]);
+  }, [debouncedSearch, mode]);
+
+  const importFuturesSqlite = useCallback(async (file: File) => {
+    setSqliteImporting(true);
+    try {
+      const result = await kbImportFuturesWeeklySqlite(file);
+      message.success(`已导入 ${result.products_selected} 个产品，新增 ${result.nav_observations_added} 条周频净值`);
+      await refresh();
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "SQLite 导入失败");
+    } finally {
+      setSqliteImporting(false);
+    }
+  }, [refresh]);
 
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => { if (refreshKey > 0) void refresh({ silent: true }); }, [refresh, refreshKey]);
@@ -142,15 +238,39 @@ export default function ProductLibraryPanel({ refreshKey = 0, selectedIds, onTog
   // The single-product calibration workspace is a sibling view, so refresh
   // the list immediately after a NAV review is saved there.
   useEffect(() => {
-    const handler = () => { void refresh({ silent: true }); };
+    const handler = () => {
+      const resumeFileId = resumeCurveReviewAfterSaveFileIdRef.current;
+      if (resumeFileId) {
+        resumeCurveReviewAfterSaveFileIdRef.current = undefined;
+        resumeCurveReviewFileIdRef.current = resumeFileId;
+      }
+      const fileId = activeReviewFileIdRef.current;
+      if (fileId) {
+        completedReviewFileIdsRef.current.add(fileId);
+        activeReviewFileIdRef.current = undefined;
+        setAutoAdvanceRequest((value) => value + 1);
+      }
+      void refresh({ silent: true });
+    };
     window.addEventListener("kb:product-updated", handler);
     return () => window.removeEventListener("kb:product-updated", handler);
   }, [refresh]);
 
   useEffect(() => {
-    if (!files.some((file) => file.parsing_status === "processing")) return;
-    const timer = window.setInterval(() => { void refresh({ silent: true }); }, 3000);
-    return () => window.clearInterval(timer);
+    const hasProcessing = files.some((file) => file.parsing_status === "processing");
+    if (!hasProcessing) {
+      setIngestionQueue(null);
+      return;
+    }
+    let cancelled = false;
+    const poll = () => {
+      void refresh({ silent: true });
+      void kbGetIngestionQueue()
+        .then((queue) => { if (!cancelled) setIngestionQueue(queue); })
+        .catch(() => { if (!cancelled) setIngestionQueue(null); });
+    };
+    const timer = window.setInterval(poll, 3000);
+    return () => { cancelled = true; window.clearInterval(timer); };
   }, [files, refresh]);
 
   // Reflect the server-side parser state in the upload batch.  Uploading a
@@ -178,10 +298,18 @@ export default function ProductLibraryPanel({ refreshKey = 0, selectedIds, onTog
         !isDemoProduct(product)
         && hasTraceableSource(product)
         && (!query || product.standard_name.toLocaleLowerCase("zh-CN").includes(query))
+        && (!strategyFilter || product.strategy === strategyFilter)
+        && (!frequencyFilter || product.nav_frequency === frequencyFilter)
+        && (!managerFilter || product.manager_name === managerFilter)
       ));
     },
-    [products, search],
+    [frequencyFilter, managerFilter, products, search, strategyFilter],
   );
+  const catalogFilterOptions = React.useMemo(() => ({
+    strategies: Array.from(new Set(products.map((product) => product.strategy).filter((value): value is string => Boolean(value)))).sort((a, b) => a.localeCompare(b, "zh")),
+    frequencies: Array.from(new Set(products.map((product) => product.nav_frequency).filter((value): value is string => Boolean(value)))).sort(),
+    managers: Array.from(new Set(products.map((product) => product.manager_name).filter((value): value is string => Boolean(value)))).sort((a, b) => a.localeCompare(b, "zh")),
+  }), [products]);
   const filenameById = React.useMemo(
     () => new Map(files.map((file) => [file.id, file.filename])),
     [files],
@@ -193,25 +321,57 @@ export default function ProductLibraryPanel({ refreshKey = 0, selectedIds, onTog
   // The queue is action-oriented: keep a bound source visible while parsing,
   // calibration or curve ownership still needs attention.
   const queueFiles = React.useMemo(
-    () => visibleFiles.filter((file) => (
+    () => visibleFiles.filter((file) => !isBulkNavDataset(file) && !["CTA策略介绍", "CTA研究/市场资料", "忽略"].includes(file.ingestion_context?.material_nature ?? "") && (
       !(file.linked_product_ids?.length)
       || file.parsing_status === "pending"
       || file.parsing_status === "processing"
       || file.parsing_status === "failed"
       || file.parsing_status === "completed_no_nav"
+      || isProductReviewFile(file)
       || (file.unbound_curve_count ?? 0) > 0
       || (file.unbound_fragment_count ?? 0) > 0
     )),
     [visibleFiles],
   );
 
+  const startProductReview = useCallback(async (file: KbFile, productIdOverride?: string): Promise<boolean> => {
+    if (openingReviewFileIdRef.current) return false;
+    const productId = file.linked_product_ids?.[0] ?? productIdOverride;
+    if (!productId) return false;
+    openingReviewFileIdRef.current = file.id;
+    try {
+      const product = products.find((candidate) => candidate.id === productId) ?? await kbGetProduct(productId);
+      if (product.confirmation_status === "rejected") {
+        message.warning("该文件已关联到被标记为非产品的记录，无法进入复核。");
+        return false;
+      }
+      activeReviewFileIdRef.current = file.id;
+      startedReviewFileIdsRef.current.add(file.id);
+      onCalibrateProduct(product, file.id);
+      return true;
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "打开产品复核失败");
+      return false;
+    } finally {
+      openingReviewFileIdRef.current = undefined;
+    }
+  }, [onCalibrateProduct, products]);
+
+  // As soon as a newly uploaded source has a defensible product target and a
+  // parsed NAV candidate, open the review workspace without another click.
+  useEffect(() => {
+    if (autoAdvanceRequest > 0 || activeReviewFileIdRef.current || !uploadBatch?.fileIds.length) return;
+    const nextFile = findNextProductReviewFile(
+      queueFiles,
+      startedReviewFileIdsRef.current,
+      uploadBatch.fileIds,
+    );
+    if (nextFile) void startProductReview(nextFile);
+  }, [autoAdvanceRequest, queueFiles, startProductReview, uploadBatch?.fileIds]);
+
   const researchFilteredProducts = React.useMemo(
-    () => researchFilter === "all"
-      ? visibleProducts
-      : researchFilter === "ready"
-        ? visibleProducts.filter((product) => product.research_ready)
-        : visibleProducts.filter((product) => !product.research_ready),
-    [researchFilter, visibleProducts],
+    () => visibleProducts.filter((product) => mode === "catalog" ? isResearchReady(product) : !isResearchReady(product)),
+    [mode, visibleProducts],
   );
 
   const sortedProducts = React.useMemo(() => {
@@ -237,7 +397,7 @@ export default function ProductLibraryPanel({ refreshKey = 0, selectedIds, onTog
         const file = batch[nextIndex++];
         if (!file) continue;
         try {
-          const result = await kbUploadFile(file);
+          const result = await kbUploadFile(file, uploadMaterialNature);
           setUploadBatch((previous) => previous ? {
             ...previous,
             uploaded: previous.uploaded + 1,
@@ -258,7 +418,7 @@ export default function ProductLibraryPanel({ refreshKey = 0, selectedIds, onTog
     };
     await Promise.all(Array.from({ length: Math.min(2, batch.length) }, worker));
     message.success(`已提交 ${batch.length} 份资料，正在后台识别`);
-  }, [refresh]);
+  }, [refresh, uploadMaterialNature]);
 
   const stageUpload = useCallback((file: File) => {
     stagedUploadsRef.current.push(file);
@@ -279,6 +439,16 @@ export default function ProductLibraryPanel({ refreshKey = 0, selectedIds, onTog
       void refresh();
     } catch {
       message.error("重新解析失败，请重新上传");
+    }
+  }, [refresh]);
+
+  const classifyQueueFile = useCallback(async (fileId: string, materialNature: "CTA策略介绍" | "CTA研究/市场资料" | "忽略") => {
+    try {
+      await kbUpdateFileMaterialNature(fileId, materialNature);
+      message.success(materialNature === "忽略" ? "已移出待办，原始资料仍保留" : "已归档为研究证据，不再要求净值校准");
+      void refresh({ silent: true });
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "更新资料用途失败");
     }
   }, [refresh]);
 
@@ -322,30 +492,33 @@ export default function ProductLibraryPanel({ refreshKey = 0, selectedIds, onTog
           };
       const result = await kbBindFile(bindingFile.id, payload);
       message.success(`已绑定到「${result.product_name}」`);
+      const boundFile = bindingFile;
       setBindingFile(null);
       bindingForm.resetFields();
-      void refresh();
+      void refresh({ silent: true });
+      // Binding resolves identity; it is not the end of the workflow.  Load
+      // the resulting product and continue directly into source review.
+      void startProductReview(boundFile, result.product_id);
     } catch (error) {
       if (error instanceof Error) message.error(error.message || "绑定产品失败");
     } finally {
       setBindingSubmitting(false);
     }
-  }, [bindingFile, bindingForm, bindingMode, refresh]);
+  }, [bindingFile, bindingForm, bindingMode, refresh, startProductReview]);
 
   const openCurveBinding = useCallback((file: KbFile) => {
-    const initial: Record<string, string> = {};
-    (file.curve_bindings ?? []).filter((item) => item.binding_status !== "matched").forEach((item) => {
-      if (item.product_id) initial[item.fragment_id] = item.product_id;
-    });
-    setCurveBindingValues(initial);
     setCurveBindingFile(file);
   }, []);
 
-  const handleBindCurves = useCallback(async () => {
+  const createCurveProduct = useCallback(async (standardName: string): Promise<KbProduct> => {
+    const created = await kbCreateProduct({ standard_name: standardName });
+    const product = await kbGetProduct(created.id);
+    setProducts((current) => current.some((item) => item.id === product.id) ? current : [product, ...current]);
+    return product;
+  }, []);
+
+  const handleBindCurves = useCallback(async (bindings: CurveReviewChoice[], openAfterSubmit?: CurveReviewChoice, startQueue = false) => {
     if (!curveBindingFile) return;
-    const bindings = (curveBindingFile.curve_bindings ?? [])
-      .filter((item) => item.binding_status !== "matched" && curveBindingValues[item.fragment_id])
-      .map((item) => ({ fragment_id: item.fragment_id, product_id: curveBindingValues[item.fragment_id]! }));
     if (!bindings.length) {
       message.warning("请至少为一条曲线选择产品");
       return;
@@ -354,14 +527,39 @@ export default function ProductLibraryPanel({ refreshKey = 0, selectedIds, onTog
     try {
       const result = await kbBindFileCurves(curveBindingFile.id, bindings);
       message.success(`已确认 ${result.bound_curves} 条曲线归属`);
+      const sourceFile = curveBindingFile;
       setCurveBindingFile(null);
-      void refresh();
+      await refresh({ silent: true });
+      if (openAfterSubmit) {
+        const product = products.find((item) => item.id === openAfterSubmit.product_id) ?? await kbGetProduct(openAfterSubmit.product_id);
+        // Resume this source only after the reviewer saves the current NAV.
+        // Until then the calibration workspace must remain unobstructed.
+        resumeCurveReviewAfterSaveFileIdRef.current = sourceFile.id;
+        onCalibrateProduct(product, sourceFile.id, openAfterSubmit.region, openAfterSubmit.fragment_id);
+      } else if (startQueue) {
+        const queue = await Promise.all(bindings.map(async (choice) => ({
+          product: products.find((item) => item.id === choice.product_id) ?? await kbGetProduct(choice.product_id),
+          sourceFileId: sourceFile.id,
+          sourceRegion: choice.region,
+          sourceFragmentId: choice.fragment_id,
+        })));
+        onStartCalibrationQueue(queue);
+      }
     } catch (error) {
       message.error(error instanceof Error ? error.message : "批量绑定曲线失败");
     } finally {
       setBindingSubmitting(false);
     }
-  }, [curveBindingFile, curveBindingValues, refresh]);
+  }, [curveBindingFile, onCalibrateProduct, onStartCalibrationQueue, products, refresh]);
+
+  useEffect(() => {
+    const fileId = resumeCurveReviewFileIdRef.current;
+    if (!fileId || curveBindingFile) return;
+    const refreshedFile = files.find((file) => file.id === fileId);
+    if (!refreshedFile) return;
+    resumeCurveReviewFileIdRef.current = undefined;
+    if ((refreshedFile.unbound_curve_count ?? 0) > 0) openCurveBinding(refreshedFile);
+  }, [curveBindingFile, files, openCurveBinding]);
 
   const handleDelete = useCallback((product: KbProduct) => {
     Modal.confirm({
@@ -375,8 +573,8 @@ export default function ProductLibraryPanel({ refreshKey = 0, selectedIds, onTog
           await kbDeleteProduct(product.id);
           message.success("已删除");
           void refresh();
-        } catch {
-          message.error("删除失败");
+        } catch (error) {
+          message.error(error instanceof Error ? error.message : "删除产品失败");
         }
       },
     });
@@ -460,22 +658,132 @@ export default function ProductLibraryPanel({ refreshKey = 0, selectedIds, onTog
     }
   }, [refresh, visibleProducts]);
 
-  const pendingCount = visibleProducts.filter((p) => p.confirmation_status === "pending").length;
+  const productActionLabel = useCallback((product: KbProduct): string | null => {
+    const action = productWorkflowAction(product, {
+      editIdentity: () => openEdit(product, true),
+      calibrateNav: () => {
+        activeReviewFileIdRef.current = undefined;
+        onCalibrateProduct(product);
+      },
+      confirmIdentity: () => void handleConfirm(product.id),
+    });
+    return action?.label ?? null;
+  }, [handleConfirm, onCalibrateProduct, openEdit]);
+
+  const handleNextTask = useCallback(() => {
+    const decision = decideNextTask(
+      queueFiles,
+      visibleProducts,
+      completedReviewFileIdsRef.current,
+      uploadBatch?.fileIds,
+      productActionLabel,
+    );
+    switch (decision.kind) {
+      case "review":
+      case "recover":
+        void startProductReview(decision.file);
+        return;
+      case "bind":
+        openBinding(decision.file);
+        return;
+      case "curves":
+        openCurveBinding(decision.file);
+        return;
+      case "reparse":
+        void handleReparse(decision.file.id);
+        return;
+      case "product": {
+        const action = productWorkflowAction(decision.product, {
+          editIdentity: () => openEdit(decision.product, true),
+          calibrateNav: () => {
+            activeReviewFileIdRef.current = undefined;
+            onCalibrateProduct(decision.product);
+          },
+          confirmIdentity: () => void handleConfirm(decision.product.id),
+        });
+        if (action) {
+          action.run();
+          return;
+        }
+        break;
+      }
+      case "waiting":
+        setUploadExpanded(true);
+        message.info(`还有 ${decision.waitingCount} 份资料在后台解析；完成后队列会自动刷新，无需重复上传。`);
+        return;
+      case "idle":
+        message.info("当前没有可继续处理的待办。");
+        return;
+    }
+  }, [handleConfirm, handleReparse, onCalibrateProduct, openBinding, openCurveBinding, openEdit, productActionLabel, queueFiles, startProductReview, uploadBatch?.fileIds, visibleProducts]);
+
+  // The calibration page is rendered by the parent.  Once it broadcasts a
+  // successful save, this mounted (but possibly hidden) workbench advances to
+  // the next parsed product instead of making the user return and click again.
+  useEffect(() => {
+    if (!autoAdvanceRequest || activeReviewFileIdRef.current) return;
+    const decision = decideNextTask(
+      queueFiles,
+      visibleProducts,
+      completedReviewFileIdsRef.current,
+      uploadBatch?.fileIds,
+      // Auto-advance only walks the file queue; product-level actions stay
+      // on the cards so the user remains in control of identity decisions.
+      () => null,
+    );
+    switch (decision.kind) {
+      case "review":
+        void startProductReview(decision.file).then((opened) => {
+          if (opened) setAutoAdvanceRequest(0);
+        });
+        return;
+      case "bind":
+        openBinding(decision.file);
+        setAutoAdvanceRequest(0);
+        return;
+      case "curves":
+        openCurveBinding(decision.file);
+        setAutoAdvanceRequest(0);
+        return;
+      case "waiting":
+        // Keep the request pending; the poll refresh re-runs this effect once
+        // parsing finishes and a reviewable candidate appears.
+        return;
+      default:
+        setAutoAdvanceRequest(0);
+        return;
+    }
+  }, [autoAdvanceRequest, openBinding, openCurveBinding, queueFiles, startProductReview, uploadBatch?.fileIds, visibleProducts]);
+
   const pendingFileCount = queueFiles.filter((f) => f.parsing_status === "pending" || f.parsing_status === "processing").length;
-  const isResearchReady = (product: KbProduct) => product.research_ready ?? (
-    !needsManualNaming(product)
-    && product.nav_count >= 2
-    && product.confirmation_status === "confirmed"
-    && (product.source_file_ids?.length ?? 0) > 0
-    && product.reviewed_nav_count >= product.nav_count
-  );
   const bindingProducts = visibleProducts.filter((product) => product.confirmation_status !== "rejected");
   const readyCount = visibleProducts.filter(isResearchReady).length;
   const actionableCount = Math.max(0, visibleProducts.length - readyCount);
   const needsNamingCount = visibleProducts.filter(needsManualNaming).length;
-  const reviewCandidateFileCount = queueFiles.filter((file) => file.workflow?.next_action === "review_candidate").length;
-  const bindingTaskCount = queueFiles.filter((file) => file.workflow?.next_action === "confirm_product_binding").length;
-  const calibrationTaskCount = queueFiles.filter((file) => file.workflow?.next_action === "recover_chart_calibration").length;
+  // The button label and handleNextTask share one decision, so the label can
+  // never promise a task the click does not deliver.
+  const nextTask = React.useMemo(
+    () => decideNextTask(queueFiles, visibleProducts, completedReviewFileIdsRef.current, uploadBatch?.fileIds, productActionLabel),
+    [queueFiles, visibleProducts, uploadBatch?.fileIds, productActionLabel],
+  );
+  const nextTaskLabel = nextTask.label;
+  // Surface the async pipeline: which files are in flight, how many slots the
+  // backend runs, and how many files are still queued behind the semaphore.
+  const processingNames = React.useMemo(
+    () => files.filter((file) => file.parsing_status === "processing").map((file) => file.filename),
+    [files],
+  );
+  const activeNames = React.useMemo(() => {
+    const activeFileIds = new Set(ingestionQueue?.active_file_ids ?? []);
+    return files
+      .filter((file) => file.parsing_status === "processing" && activeFileIds.has(file.id))
+      .map((file) => file.filename);
+  }, [files, ingestionQueue]);
+  const processingLead = pendingFileCount > 0
+    ? activeNames.length > 0
+      ? `后台异步识别中「${activeNames[0]}」${processingNames.length > 1 ? ` 等 ${processingNames.length} 份` : ""}`
+      : `后台异步识别中 ${processingNames.length} 份`
+    : "";
   // An uploaded file is not automatically a research-ready product. Keep the
   // compact summary explicit so “可研究 0” is not mistaken for a failed upload.
   const uploadSummary = queueFiles.length === 0
@@ -483,7 +791,7 @@ export default function ProductLibraryPanel({ refreshKey = 0, selectedIds, onTog
     : readyCount > 0
     ? `待处理 ${queueFiles.length} 份资料 · 可研究 ${readyCount} 个产品`
     : pendingFileCount > 0
-      ? `待处理 ${queueFiles.length} 份资料 · ${pendingFileCount} 份正在解析`
+      ? `待处理 ${queueFiles.length} 份资料 · ${processingLead}`
       : needsNamingCount > 0
         ? `待处理 ${queueFiles.length} 份资料 · ${needsNamingCount} 个产品待命名`
         : visibleProducts.length > 0
@@ -498,188 +806,51 @@ export default function ProductLibraryPanel({ refreshKey = 0, selectedIds, onTog
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", gap: 10, overflow: "hidden" }}>
-      {/* Upload area */}
-      <Card size="small" style={{ flexShrink: 0 }} styles={{ body: { padding: queueFiles.length > 0 && !uploadExpanded ? "6px 8px" : 10 } }}>
-        {queueFiles.length > 0 && !uploadExpanded ? (
-          <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 24 }}>
-            <FileOutlined style={{ color: "var(--serif-accent, #1677ff)" }} />
-            <Text ellipsis style={{ flex: 1, fontSize: 12 }}>{uploadSummary}</Text>
-            <Button size="small" type="text" icon={<UploadOutlined />} onClick={() => setUploadExpanded(true)}>上传</Button>
-          </div>
-        ) : <>
-          <Dragger
-            multiple
-            showUploadList={false}
-            beforeUpload={(file) => { stageUpload(file); return false; }}
-            disabled={uploadCount > 0}
-            style={{ padding: "6px 0" }}
-          >
-            <p className="ant-upload-drag-icon" style={{ marginBottom: 2 }}>
-              <InboxOutlined style={{ color: "var(--serif-accent, #1677ff)" }} />
-            </p>
-            <p style={{ margin: 0, fontSize: 12, color: "var(--serif-text-secondary, #666)" }}>
-              {uploadCount > 0 ? `上传中 (${uploadCount})...` : "拖拽或点击上传 PDF / 图片 / XLSX / CSV / DOCX / PPTX"}
-            </p>
-          </Dragger>
-          {uploadBatch && (
-            <div style={{ marginTop: 8 }}>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, fontSize: 11 }}>
-                <Text style={{ fontSize: 11 }}>
-                  本批 {uploadBatch.total} 份：已上传 {uploadBatch.uploaded}/{uploadBatch.total}
-                  {batchActiveCount > 0 ? ` · 识别中 ${batchActiveCount}` : ""}
-                  {uploadBatch.completed > 0 ? ` · 已完成 ${uploadBatch.completed}` : ""}
-                  {uploadBatch.failed > 0 ? ` · 失败 ${uploadBatch.failed}` : ""}
-                  {batchTerminalCount > 0 ? ` · 净值已提取 ${batchNavExtractedCount}` : ""}
-                </Text>
-                {batchTerminalCount === uploadBatch.total && <Tag color={uploadBatch.failed ? "warning" : "success"} style={{ margin: 0, fontSize: 10 }}>
-                  {uploadBatch.failed ? "解析完成，含失败" : "解析完成"}
-                </Tag>}
-              </div>
-              <Progress
-                percent={batchPercent}
-                size="small"
-                status={uploadBatch.failed > 0 ? "exception" : batchTerminalCount === uploadBatch.total ? "success" : "active"}
-                showInfo={false}
-                style={{ margin: "3px 0 0" }}
-              />
-            </div>
-          )}
-          {queueFiles.length > 0 && (
-            <div style={{ marginTop: 6, maxHeight: 88, overflow: "auto" }}>
-              <div style={{ display: "flex", gap: 5, marginBottom: 4 }}>
-                <Tag color="success" style={{ margin: 0, fontSize: 10 }}>可研究 {readyCount}</Tag>
-                <Tag color="processing" style={{ margin: 0, fontSize: 10 }}>待确认 {pendingCount}</Tag>
-                 {needsNamingCount > 0 && <Tag color="warning" style={{ margin: 0, fontSize: 10 }}>待命名 {needsNamingCount}</Tag>}
-                 {reviewCandidateFileCount > 0 && <Tag color="success" style={{ margin: 0, fontSize: 10 }}>审核候选 {reviewCandidateFileCount}</Tag>}
-                 {bindingTaskCount > 0 && <Tag color="warning" style={{ margin: 0, fontSize: 10 }}>确认绑定 {bindingTaskCount}</Tag>}
-                 {calibrationTaskCount > 0 && <Tag color="processing" style={{ margin: 0, fontSize: 10 }}>校准恢复 {calibrationTaskCount}</Tag>}
-              </div>
-              {queueFiles.map((f) => {
-                const tag = PARSING_TAG[f.parsing_status] ?? { color: "default", label: "未知" };
-                const linkedProduct = f.linked_product_ids?.[0]
-                  ? products.find((item) => item.id === f.linked_product_ids?.[0])
-                  : undefined;
-                const needsBinding = !f.linked_product_ids?.length;
-                const needsCurveBinding = !needsBinding && (f.unbound_curve_count ?? 0) > 0;
-                const needsCalibration = f.parsing_status === "completed_no_nav" && linkedProduct;
-                const workflowAction = f.workflow?.next_action;
-                const filePrimaryAction = workflowAction === "confirm_product_binding"
-                  ? { label: "确认绑定", run: () => openBinding(f) }
-                  : workflowAction === "recover_chart_calibration" && linkedProduct
-                    ? { label: "恢复校准", run: () => onCalibrateProduct(linkedProduct, f.id) }
-                    : needsBinding
-                  ? { label: "绑定产品", run: () => openBinding(f) }
-                  : needsCurveBinding
-                    ? { label: "确认曲线", run: () => openCurveBinding(f) }
-                    : needsCalibration
-                      ? { label: "校准净值", run: () => onCalibrateProduct(linkedProduct, f.id) }
-                      : f.parsing_status === "failed"
-                        ? { label: "重新解析", run: () => void handleReparse(f.id) }
-                        : null;
-                return (
-                  <div key={f.id} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, padding: "2px 0" }}>
-                    <FileOutlined style={{ flexShrink: 0 }} />
-                    <Text ellipsis style={{ flex: 1, fontSize: 11 }}>{f.filename}</Text>
-                    <Tag color={tag.color} style={{ margin: 0, fontSize: 10, lineHeight: "16px" }}>{tag.label}</Tag>
-                    {f.parsing_error && (
-                      <Tooltip title={f.parsing_error}>
-                        <Text type="warning" style={{ fontSize: 10, flexShrink: 0 }}>原因</Text>
-                      </Tooltip>
-                    )}
-                    <Text type="secondary" ellipsis style={{ maxWidth: 140, fontSize: 10 }}>
-                      {f.linked_product_names?.length ? f.linked_product_names.join("、") : "尚未绑定产品"}
-                    </Text>
-                    {(f.unbound_curve_count ?? 0) > 0 && (
-                      <Tooltip title={
-                        <div>
-                          <div>曲线未按位置自动绑定；请根据图例或原图确认。</div>
-                          {(f.curve_bindings ?? []).filter((item) => item.binding_status !== "matched").map((item) => (
-                            <div key={item.fragment_id}>
-                              曲线 {item.curve_index} · {item.legend_label || "无图例"} · 置信度 {Math.round((item.binding_confidence ?? 0) * 100)}%
-                            </div>
-                          ))}
-                        </div>
-                      }>
-                        <Tag color="warning" style={{ margin: 0, fontSize: 10, lineHeight: "16px" }}>待绑定 {f.unbound_curve_count}</Tag>
-                      </Tooltip>
-                    )}
-                    {filePrimaryAction && (
-                      <Button type="link" size="small" icon={needsBinding ? <LinkOutlined /> : undefined} style={{ padding: 0, height: 24, fontSize: 11, flexShrink: 0 }} onClick={filePrimaryAction.run}>
-                        {filePrimaryAction.label}
-                      </Button>
-                    )}
-                    <Dropdown trigger={["click"]} menu={{ items: [
-                      ...(filePrimaryAction?.label !== "重新解析" ? [{ key: "reparse", icon: <ReloadOutlined />, label: "重新解析", onClick: () => void handleReparse(f.id) }] : []),
-                      { key: "delete", icon: <DeleteOutlined />, label: "删除资料", danger: true, onClick: () => handleDeleteFile(f) },
-                    ] }}>
-                      <Button type="text" size="small" icon={<MoreOutlined />} aria-label={`${f.filename} 更多操作`} style={{ width: 24, height: 24, minWidth: 24 }} />
-                    </Dropdown>
-                  </div>
-                );
-              })}
-              <Button type="link" size="small" style={{ padding: 0, height: 18, fontSize: 11 }} onClick={() => setUploadExpanded(false)}>收起资料</Button>
-            </div>
-          )}
-        </>}
-      </Card>
+      {mode === "queue" && <MaterialUploadCard
+        hasQueue={queueFiles.length > 0}
+        expanded={uploadExpanded}
+        onExpandedChange={setUploadExpanded}
+        summary={uploadSummary}
+        nextTaskLabel={nextTaskLabel}
+        onNextTask={handleNextTask}
+        uploadCount={uploadCount}
+        onStageUpload={stageUpload}
+        materialNature={uploadMaterialNature}
+        onMaterialNatureChange={setUploadMaterialNature}
+        batch={uploadBatch}
+        batchPercent={batchPercent}
+        batchActiveCount={batchActiveCount}
+        batchNavExtractedCount={batchNavExtractedCount}
+        processingNames={processingNames}
+        maxConcurrency={ingestionQueue?.max_concurrency}
+        queuedCount={ingestionQueue?.queued_count}
+        queueFiles={queueFiles}
+        activeFileIds={ingestionQueue?.active_file_ids}
+        onClassifyFile={(fileId, materialNature) => void classifyQueueFile(fileId, materialNature)}
+      />}
 
-      <Modal
-        title={curveBindingFile ? `分别绑定曲线 · ${curveBindingFile.filename}` : "分别绑定曲线"}
+      {mode === "queue" && <MultiProductReviewModal
+        file={curveBindingFile}
+        products={bindingProducts}
         open={curveBindingFile !== null}
+        submitting={bindingSubmitting}
         onCancel={() => { if (!bindingSubmitting) setCurveBindingFile(null); }}
-        onOk={() => void handleBindCurves()}
-        okText="确认所选归属"
-        cancelText="取消"
-        confirmLoading={bindingSubmitting}
-        width={640}
-      >
-        <Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 12 }}>
-          系统不会按曲线位置猜测归属。仅确认您选中的曲线；未选择的仍保持待绑定。
-        </Text>
-        <Space direction="vertical" size={10} style={{ width: "100%" }}>
-          {(curveBindingFile?.curve_bindings ?? []).filter((item) => item.binding_status !== "matched").map((item) => (
-            <Card key={item.fragment_id} size="small" styles={{ body: { padding: "8px 10px" } }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                <Tag color="warning" style={{ margin: 0 }}>曲线 {item.curve_index}</Tag>
-                <Text style={{ flex: 1 }} ellipsis>{item.legend_label || "未读取到图例名称"}</Text>
-                <Text type="secondary" style={{ fontSize: 11 }}>识别 {Math.round((item.binding_confidence ?? 0) * 100)}%</Text>
-              </div>
-              <Select
-                allowClear
-                placeholder="选择该曲线对应的产品"
-                value={curveBindingValues[item.fragment_id]}
-                onChange={(value) => setCurveBindingValues((current) => ({ ...current, [item.fragment_id]: value }))}
-                style={{ width: "100%", marginTop: 8 }}
-                options={bindingProducts.map((product) => ({ value: product.id, label: product.standard_name }))}
-              />
-              {!!item.binding_evidence?.length && <Text type="secondary" style={{ fontSize: 11 }}>{item.binding_evidence.join("；")}</Text>}
-            </Card>
-          ))}
-        </Space>
-      </Modal>
+        onSubmit={handleBindCurves}
+        onCreateProduct={createCurveProduct}
+      />}
 
       {/* Filter + search */}
       <div style={{ flexShrink: 0, display: "flex", flexDirection: "column", gap: 8 }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-          <Text strong>产品库</Text>
-          <Dropdown trigger={["click"]} menu={{ items: [
+          <Text strong>{mode === "catalog" ? "产品列表" : "待处理队列"}</Text>
+          {mode === "queue" && <Dropdown trigger={["click"]} menu={{ items: [
+            { key: "sqlite-import", label: <label style={{ cursor: sqliteImporting ? "wait" : "pointer" }}>导入期货周频 SQLite<input type="file" accept=".sqlite,.sqlite3,.db" disabled={sqliteImporting} style={{ display: "none" }} onChange={(event) => { const file = event.target.files?.[0]; if (file) void importFuturesSqlite(file); event.currentTarget.value = ""; }} /></label> },
             { key: "machine-review", label: machineReviewing ? "正在自动检查…" : "自动检查待复核曲线", disabled: machineReviewing, onClick: () => void handleMachineReview() },
-            { key: "refresh", icon: <ReloadOutlined />, label: "刷新产品库", onClick: () => void refresh() },
+            { key: "refresh", icon: <ReloadOutlined />, label: "刷新列表", onClick: () => void refresh() },
           ] }}>
-            <Button size="small" type="text" icon={<MoreOutlined />} aria-label="产品库更多操作" />
-          </Dropdown>
+            <Button size="small" type="text" icon={<MoreOutlined />} aria-label="复核队列更多操作" />
+          </Dropdown>}
         </div>
-        <Segmented
-          block
-          size="small"
-          value={researchFilter}
-          onChange={(value) => setResearchFilter(value as ResearchFilter)}
-          options={[
-            { value: "all", label: "全部" },
-            { value: "actionable", label: <Badge count={actionableCount} size="small" offset={[7, 0]}><span>待处理</span></Badge> },
-            { value: "ready", label: <Badge count={readyCount} size="small" offset={[7, 0]}><span>可研究</span></Badge> },
-          ]}
-        />
         <div style={{ display: "flex", gap: 6 }}>
           <Input
             size="small"
@@ -702,161 +873,86 @@ export default function ProductLibraryPanel({ refreshKey = 0, selectedIds, onTog
             ]}
           />
         </div>
+        {mode === "catalog" && <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+          <Select
+            size="small"
+            allowClear
+            placeholder="策略分类"
+            value={strategyFilter}
+            onChange={setStrategyFilter}
+            style={{ width: 132 }}
+            options={catalogFilterOptions.strategies.map((value) => ({ value, label: value }))}
+          />
+          <Select
+            size="small"
+            allowClear
+            placeholder="净值频率"
+            value={frequencyFilter}
+            onChange={setFrequencyFilter}
+            style={{ width: 112 }}
+            options={catalogFilterOptions.frequencies.map((value) => ({ value, label: value === "daily" ? "日频" : value === "weekly" ? "周频" : value === "monthly" ? "月频" : value }))}
+          />
+          <Select
+            size="small"
+            allowClear
+            showSearch
+            optionFilterProp="label"
+            placeholder="管理人"
+            value={managerFilter}
+            onChange={setManagerFilter}
+            style={{ width: 150 }}
+            options={catalogFilterOptions.managers.map((value) => ({ value, label: value }))}
+          />
+          {(strategyFilter || frequencyFilter || managerFilter) && <Button size="small" type="link" onClick={() => { setStrategyFilter(undefined); setFrequencyFilter(undefined); setManagerFilter(undefined); }}>清除筛选</Button>}
+        </div>}
       </div>
 
       {/* Product list */}
       <div ref={listRef} style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
         {sortedProducts.length === 0 && !loading ? (
-          <Empty description={researchFilter === "all" ? "暂无产品" : "当前状态下暂无产品"} image={Empty.PRESENTED_IMAGE_SIMPLE} style={{ marginTop: 40 }} />
+          <Empty description={mode === "catalog" ? "当前没有已审核产品" : "当前没有待处理项目"} image={Empty.PRESENTED_IMAGE_SIMPLE} style={{ marginTop: 40 }} />
         ) : (
           <List
             size="small"
             loading={loading}
             dataSource={sortedProducts}
-            renderItem={(product) => {
-              const isSelected = selectedIds.includes(product.id);
-              const requiresNaming = needsManualNaming(product);
-              const canResearch = isResearchReady(product);
-              const reviewConfidence = product.nav_count > 0 ? Math.round(product.reviewed_nav_count / product.nav_count * 100) : 0;
-              const navReviewComplete = product.nav_count >= 2 && product.reviewed_nav_count === product.nav_count;
-              const extractionConfidence = product.nav_confidence;
-              const confidenceBand = product.nav_confidence_band
-                ?? (extractionConfidence == null ? "unknown" : extractionConfidence >= 0.85 ? "high" : extractionConfidence >= 0.60 ? "medium" : "low");
-              const confidenceLabel = confidenceBand === "high" ? "高" : confidenceBand === "medium" ? "中" : confidenceBand === "low" ? "低" : "未评估";
-              const displayStrategy = strategyLabel(product.strategy);
-              const dataStatus = requiresNaming
-                ? { color: "warning", label: "待人工命名" }
-                : navReviewComplete
-                  ? { color: "success", label: "净值已复核" }
-                : product.nav_count >= 2 && product.fact_count > 0
-                  ? { color: "success", label: "可研究" }
-                  : product.nav_count >= 2
-                    ? { color: "processing", label: "待复核净值" }
-                    : product.fact_count > 0
-                      ? { color: "processing", label: "待补净值" }
-                      : { color: "default", label: "待补资料" };
-              const resolvedDataStatus = product.nav_quality?.blocking
-                ? { color: "error", label: "曲线与披露冲突" }
-                : product.research_ready
-                ? { color: "success", label: "可研究" }
-                : navReviewComplete
-                ? { color: "success", label: "净值已复核" }
-                : product.readiness_reason
-                  ? { color: "processing", label: product.readiness_reason }
-                  : dataStatus;
-              const displayStatus = product.confirmation_status === "pending" && navReviewComplete
-                ? { color: "processing", label: "待确认产品" }
-                : resolvedDataStatus;
-              const needsNavReview = !requiresNaming
-                && product.confirmation_status !== "rejected"
-                && (product.nav_count < 2 || reviewConfidence < 100 || product.nav_quality?.blocking);
-              const primaryAction = requiresNaming
-                ? { label: "完善产品信息", run: () => openEdit(product, true) }
-                : needsNavReview
-                  ? { label: product.nav_count < 2 ? "提取 / 补录净值" : "复核净值", run: () => onCalibrateProduct(product) }
-                  : product.confirmation_status === "pending"
-                    ? { label: "确认产品", run: () => void handleConfirm(product.id) }
-                    : null;
-              return (
-                <div
-                  key={product.id}
-                  style={{
-                    padding: "5px 10px",
-                    borderRadius: 6,
-                    border: `1px solid ${isSelected ? "var(--serif-accent, #1677ff)" : "var(--serif-border, #f0f0f0)"}`,
-                    marginBottom: 4,
-                    background: isSelected ? "var(--serif-accent-bg, #f0f5ff)" : "var(--serif-card-bg, #fff)",
-                    cursor: "pointer",
-                    transition: "border-color 0.2s",
-                  }}
-                  onClick={() => {
-                    if (requiresNaming) {
-                      message.info("该记录尚未形成可靠产品名称，请右键选择“编辑信息”后再加入候选池。");
-                      return;
-                    }
-                    if (product.confirmation_status === "rejected") {
-                      message.info("该记录已标为不是产品，不会进入 Agent 研究上下文。");
-                      return;
-                    }
-                    if (!canResearch) {
-                      message.info(product.readiness_reason ?? "请先完成产品身份与净值复核");
-                      return;
-                    }
-                    onFocusProduct(product); onToggleSelect(product.id);
-                  }}
-                >
-                  <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
-                    <Checkbox
-                      checked={isSelected}
-                      disabled={!canResearch}
-                      style={{ marginTop: 2 }}
-                      onClick={(event) => event.stopPropagation()}
-                      onChange={() => { onFocusProduct(product); onToggleSelect(product.id); }}
-                    />
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                        <Text strong ellipsis style={{ flex: 1, fontSize: 13 }}>{product.standard_name}</Text>
-                        <Tag color={displayStatus.color} title={extractionConfidence != null ? `识别置信度 ${(extractionConfidence * 100).toFixed(0)}%（${confidenceLabel}）` : "尚未获得识别置信度"} style={{ margin: 0, fontSize: 10, lineHeight: "16px" }}>{displayStatus.label}</Tag>
-                        <Dropdown trigger={["click"]} menu={{ items: [
-                          { key: "edit", icon: <EditOutlined />, label: "编辑信息", onClick: () => openEdit(product) },
-                          ...(product.confirmation_status !== "rejected" ? [{ key: "reject", label: "标记为非产品", danger: true, onClick: () => void handleReject(product.id) }] : []),
-                          { key: "delete", icon: <DeleteOutlined />, label: "删除产品", danger: true, onClick: () => handleDelete(product) },
-                        ] }}>
-                          <Button type="text" size="small" icon={<MoreOutlined />} aria-label={`${product.standard_name} 更多操作`} style={{ width: 24, height: 24, minWidth: 24 }} onClick={(event) => event.stopPropagation()} />
-                        </Dropdown>
-                      </div>
-                      <div style={{ marginTop: 2, display: "flex", gap: 8, fontSize: 11, color: "var(--serif-text-secondary, #888)" }}>
-                        {product.manager_name && <span>{product.manager_name}</span>}
-                        {displayStrategy && <span>{displayStrategy}</span>}
-                        {product.nav_methods?.[0] && <span title={product.nav_methods[0]}>来源：{product.nav_methods[0]}</span>}
-                      </div>
-                      {requiresNaming && <Text type="secondary" style={{ display: "block", marginTop: 2, fontSize: 11 }}>识别文本已保留，需核对并编辑正式名称</Text>}
-                      {!requiresNaming && <Text type="secondary" style={{ display: "block", marginTop: 2, fontSize: 11 }}>
-                        净值 {product.nav_count} 条 · 复核 {reviewConfidence}% · 识别置信 {extractionConfidence == null ? "未评估" : `${(extractionConfidence * 100).toFixed(0)}%（${confidenceLabel}）`} · 证据 {product.fact_count} 条
-                      </Text>}
-                      {!requiresNaming && product.machine_nav_review && (
-                        <Text type={product.machine_nav_review.machine_reviewed ? "success" : "warning"} style={{ display: "block", marginTop: 2, fontSize: 11 }}>
-                          {product.machine_nav_review.machine_reviewed
-                            ? "机器复核通过：可进入初步研究（非人工事实核验）"
-                            : `需人工处理：${product.machine_nav_review.reasons[0] ?? "机器复核未通过"}`}
-                        </Text>
-                      )}
-                      {!requiresNaming && confidenceBand === "low" && reviewConfidence < 100 && (
-                        <Text type="warning" style={{ display: "block", marginTop: 2, fontSize: 11 }}>识别置信度较低，必须复核后才能研究</Text>
-                      )}
-                      {product.confirmation_status === "pending" && !requiresNaming && (
-                        <div style={{ marginTop: 3, fontSize: 11, lineHeight: 1.5, color: "var(--serif-text-secondary, #888)" }}>
-                          <div>识别范围：{product.nav_start && product.nav_end ? `${product.nav_start} 至 ${product.nav_end}` : "未识别日期"} · {product.reviewed_nav_count}/{product.nav_count} 已复核</div>
-                          <div>来源：{(() => {
-                            const filenames = product.source_files.length > 0
-                              ? product.source_files
-                              : (product.source_file_ids ?? []).map((id) => filenameById.get(id)).filter((name): name is string => Boolean(name));
-                            return filenames.length > 0 ? filenames.join("、") : "未关联原始文件";
-                          })()}</div>
-                        </div>
-                      )}
-                      {primaryAction && (
-                        <Button type="primary" size="small" block style={{ marginTop: 7 }} onClick={(event) => { event.stopPropagation(); primaryAction.run(); }}>
-                          {primaryAction.label}
-                        </Button>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              );
-            }}
+            renderItem={(product) => <ProductLibraryItem
+              product={product}
+              selected={selectedIds.includes(product.id)}
+              filenameById={filenameById}
+              onToggleSelect={onToggleSelect}
+              onEdit={openEdit}
+              onConfirm={(id) => void handleConfirm(id)}
+              onReviewCurves={(() => {
+                // A published single-product series must not be sent back to
+                // multi-product binding merely because old parser candidates
+                // remain in its source audit trail.
+                if (product.nav_count > 0 && product.reviewed_nav_count >= product.nav_count) return undefined;
+                const source = files.find((file) => product.source_file_ids?.includes(file.id) && (file.unbound_curve_count ?? 0) > 0);
+                return source ? () => openCurveBinding(source) : undefined;
+              })()}
+              onReject={(id) => void handleReject(id)}
+              onDelete={handleDelete}
+            />}
           />
         )}
       </div>
 
       {/* Footer / batch actions */}
       {selectedIds.length > 0 ? (
-        <div style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 8, padding: "4px 0", minWidth: 0 }}>
-          <Text style={{ fontSize: 11, flex: 1, minWidth: 0 }}>已加入对话上下文：{selectedIds.length} 个产品</Text>
-          <Button type="link" size="small" style={{ paddingInline: 0 }} onClick={() => selectedIds.forEach((id) => onToggleSelect(id))}>清空选择</Button>
+        <div style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 8, padding: "6px 0", minWidth: 0, flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 180px", minWidth: 0 }}>
+            <Text strong style={{ fontSize: 12 }}>研究对象：{selectedIds.length} 个产品</Text>
+            <Text type="secondary" style={{ display: "block", fontSize: 11 }}>用于工作台筛选与 Agent 研究，不等同于对比对象。</Text>
+          </div>
+          <Button size="small" onClick={() => onOpenSelection(selectedIds, "agent")}>进入 Agent 对话</Button>
+          <Button size="small" onClick={() => onOpenSelection(selectedIds, "scores")}>查看评分与画像</Button>
+          <Button size="small" onClick={() => onOpenSelection(selectedIds, "ranking")}>查看周度排名</Button>
+          {selectedIds.length >= 2 && <Button size="small" type="primary" onClick={() => onOpenSelection(selectedIds, "portfolio")}>组合风险分析</Button>}
+          <Button type="link" size="small" style={{ paddingInline: 0 }} onClick={() => selectedIds.forEach((id) => onToggleSelect(id))}>清空研究对象</Button>
         </div>
       ) : (
-        <Text type="secondary" style={{ flexShrink: 0, fontSize: 11 }}>{sortedProducts.length} 个产品 · 点击可研究产品即可加入对话</Text>
+        <Text type="secondary" style={{ flexShrink: 0, fontSize: 11 }}>{mode === "catalog" ? "仅显示已审核、可直接研究的产品。点击产品即可加入研究对象。" : "仅显示待处理产品；已完成产品可在“产品列表”中查看。"}</Text>
       )}
 
       <Modal

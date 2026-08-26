@@ -1,0 +1,96 @@
+# FOF Agent 黄金样本测试数据
+# 此文件定义了 FOF 推荐代理的标准输入和期望输出
+# 用于回归测试确保核心功能不被破坏
+
+## 样本 1: 平衡型风险偏好，3 只基金
+
+### 输入
+funds:
+  - fund_id: "fund_a"
+    fund_name: "稳盈一号"
+    frequency: "monthly"
+    nav_points:
+      - observation_date: "2024-01-01", net_asset_value: 1.0000
+      - observation_date: "2024-02-01", net_asset_value: 1.0100
+      - observation_date: "2024-03-01", net_asset_value: 1.0250
+      - observation_date: "2024-04-01", net_asset_value: 1.0300
+      - observation_date: "2024-05-01", net_asset_value: 1.0400
+      - observation_date: "2024-06-01", net_asset_value: 1.0550
+      - observation_date: "2024-07-01", net_asset_value: 1.0600
+      - observation_date: "2024-08-01", net_asset_value: 1.0750
+      - observation_date: "2024-09-01", net_asset_value: 1.0800
+      - observation_date: "2024-10-01", net_asset_value: 1.0900
+      - observation_date: "2024-11-01", net_asset_value: 1.1000
+      - observation_date: "2024-12-01", net_asset_value: 1.1150
+  - fund_id: "fund_b"
+    fund_name: "成长二号"
+    frequency: "monthly"
+    nav_points:
+      - observation_date: "2024-01-01", net_asset_value: 1.0000
+      - observation_date: "2024-02-01", net_asset_value: 1.0200
+      - observation_date: "2024-03-01", net_asset_value: 1.0500
+      - observation_date: "2024-04-01", net_asset_value: 1.0300
+      - observation_date: "2024-05-01", net_asset_value: 1.0700
+      - observation_date: "2024-06-01", net_asset_value: 1.1000
+      - observation_date: "2024-07-01", net_asset_value: 1.0800
+      - observation_date: "2024-08-01", net_asset_value: 1.1200
+      - observation_date: "2024-09-01", net_asset_value: 1.1500
+      - observation_date: "2024-10-01", net_asset_value: 1.1800
+      - observation_date: "2024-11-01", net_asset_value: 1.2000
+      - observation_date: "2024-12-01", net_asset_value: 1.2500
+  - fund_id: "fund_c"
+    fund_name: "保守三号"
+    frequency: "monthly"
+    nav_points:
+      - observation_date: "2024-01-01", net_asset_value: 1.0000
+      - observation_date: "2024-02-01", net_asset_value: 1.0050
+      - observation_date: "2024-03-01", net_asset_value: 1.0080
+      - observation_date: "2024-04-01", net_asset_value: 1.0120
+      - observation_date: "2024-05-01", net_asset_value: 1.0150
+      - observation_date: "2024-06-01", net_asset_value: 1.0180
+      - observation_date: "2024-07-01", net_asset_value: 1.0200
+      - observation_date: "2024-08-01", net_asset_value: 1.0220
+
+risk_profile: "balanced"
+max_single_fund_weight: 0.6
+
+### 期望输出
+recommendations:
+  - fund_id: "fund_a"
+    weight: 0.30  # 约 30%
+  - fund_id: "fund_b"
+    weight: 0.70  # 约 70%
+
+reflection:
+  passed: true
+  checks:
+    - "所有绩效指标均由已验证的净值计算工具产生。"
+    - "推荐产品数量满足基础分散化要求。"
+    - "所有推荐权重均在单产品上限内。"
+    - "推荐权重之和为 100%。"
+
+---
+## 样本 2: 样本不足触发反思
+
+### 输入
+funds:
+  - fund_id: "insufficient_fund"
+    fund_name: "样本不足基金"
+    frequency: "monthly"
+    nav_points:
+      - observation_date: "2024-01-01", net_asset_value: 1.0000
+      - observation_date: "2024-02-01", net_asset_value: 1.0100
+      - observation_date: "2024-03-01", net_asset_value: 1.0200
+
+risk_profile: "conservative"
+
+### 期望输出
+recommendations: []
+
+reflection:
+  passed: false
+  warnings:
+    - "可推荐产品少于 2 个，无法形成有效的 FOF 分散化。"
+    - "净值观测少于 8 个，样本不足，不纳入推荐。"
+
+plan_revisions: 1

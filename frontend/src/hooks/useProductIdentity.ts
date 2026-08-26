@@ -58,7 +58,7 @@ export function useProductIdentity(): ProductIdentityState {
       const filenameIdentity = inferIdentityFromFilename(file.name);
       setProductName((previous) => previous.trim() || filenameIdentity.productName);
       if (filenameIdentity.managerName) {
-        setSourceText((previous) => previous.trim() ? previous : `文件名识别候选：管理人 ${filenameIdentity.managerName}；产品 ${filenameIdentity.productName}。请结合图片内容确认。`);
+        setSourceText((previous) => previous.trim() ? previous : `文件名识别候选：管理人 ${filenameIdentity.managerName}；产品 ${filenameIdentity.productName}。`);
       }
       const result = await recognizeProductImage(file);
       if (result.product_name_candidate) setProductName((previous) => previous.trim() || result.product_name_candidate!);

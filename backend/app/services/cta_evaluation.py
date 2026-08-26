@@ -48,7 +48,7 @@ def evaluate_nav_path(navs: list[float], dates: list[date], frequency: str) -> d
     }
 
 
-def build_attribution_tables(regression: Any) -> dict[str, list[dict[str, Any]]]:
+def build_attribution_tables(regression: Any) -> dict[str, Any]:
     """Return exposure, return attribution and model risk as distinct outputs."""
     exposure: list[dict[str, Any]] = []
     returns: list[dict[str, Any]] = []
@@ -57,6 +57,24 @@ def build_attribution_tables(regression: Any) -> dict[str, list[dict[str, Any]]]
         common = {"factor_name": factor.name, "display_name": factor.display_name, "factor_group": factor.factor_group}
         exposure.append({**common, "beta": factor.beta, "hac_t_stat": factor.t_stat, "hac_p_value": factor.p_value,
                          "bootstrap_ci_low": factor.bootstrap_ci_low, "bootstrap_ci_high": factor.bootstrap_ci_high})
-        returns.append({**common, "contribution_pct_of_mean_return": factor.contribution_pct})
+        returns.append({**common, "mean_return_contribution": factor.mean_return_contribution})
         risks.append({**common, "component_risk_contribution": regression.factor_risk_contributions.get(factor.name)})
-    return {"factor_exposure": exposure, "return_contribution": returns, "euler_risk_contribution": risks}
+    mean_product_return = getattr(regression, "mean_product_return", None)
+    mean_factor_return = getattr(regression, "mean_factor_explained_return", None)
+    intercept = getattr(regression, "intercept", None)
+    residual = (
+        float(mean_product_return - intercept - mean_factor_return)
+        if all(value is not None for value in (mean_product_return, intercept, mean_factor_return))
+        else None
+    )
+    return {
+        "factor_exposure": exposure,
+        "return_contribution": returns,
+        "euler_risk_contribution": risks,
+        "return_reconciliation": {
+            "mean_product_return": mean_product_return,
+            "mean_factor_explained_return": mean_factor_return,
+            "mean_intercept_return": intercept,
+            "mean_residual_return": round(residual, 8) if residual is not None else None,
+        },
+    }

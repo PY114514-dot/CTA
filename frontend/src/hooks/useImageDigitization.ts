@@ -110,8 +110,10 @@ export function useImageDigitization(): ImageDigitizationState {
   function handleImageValueModeChange(value: "nav" | "cumulative_return"): void {
     setImageValueMode(value);
     if (value === "cumulative_return") {
-      setImageNavMin(0);
-      setImageNavMax(100);
+      // Keep the range read from the chart (for example -5% to 25%).
+      // Defaults are only useful before any axis value has been supplied.
+      setImageNavMin((current) => current ?? 0);
+      setImageNavMax((current) => current ?? 100);
     } else {
       setImageNavMin(undefined);
       setImageNavMax(undefined);

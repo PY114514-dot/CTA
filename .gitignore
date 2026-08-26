@@ -34,3 +34,8 @@ backend/scripts/validation_out/
 # Local research samples (large and potentially confidential)
 分类结果*/
 test/
+# 本地导入的 SQLite 数据库与临时历史重写目录
+*.sqlite
+*.sqlite-*
+.codex-history-rewrite-temp/
+上期所/

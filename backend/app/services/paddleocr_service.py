@@ -11,7 +11,7 @@ import json
 import time
 from typing import Any
 
-import requests
+import httpx
 
 from app.config import (
     PADDLEOCR_API_TOKEN,
@@ -46,21 +46,21 @@ def extract_document(file_bytes: bytes, filename: str) -> PaddleOcrDocumentRespo
     data = {"model": PADDLEOCR_MODEL, "optionalPayload": json.dumps(_OPTIONAL_PAYLOAD)}
     files = {"file": (filename, io.BytesIO(file_bytes))}
     try:
-        response = requests.post(
+        response = httpx.post(
             PADDLEOCR_JOB_URL, headers=headers, data=data, files=files,
             timeout=PADDLEOCR_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
         job_id = response.json()["data"]["jobId"]
-    except (requests.RequestException, KeyError, TypeError, ValueError) as error:
+    except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
         raise PaddleOcrServiceError(f"PaddleOCR 任务提交失败：{_error_message(error)}") from error
 
     result_url = _wait_for_result(job_id, headers)
     try:
-        result_response = requests.get(result_url, timeout=PADDLEOCR_TIMEOUT_SECONDS)
+        result_response = httpx.get(result_url, timeout=PADDLEOCR_TIMEOUT_SECONDS)
         result_response.raise_for_status()
         return _parse_jsonl(result_response.text)
-    except requests.RequestException as error:
+    except httpx.HTTPError as error:
         raise PaddleOcrServiceError(f"PaddleOCR 结果下载失败：{_error_message(error)}") from error
 
 
@@ -68,13 +68,13 @@ def _wait_for_result(job_id: str, headers: dict[str, str]) -> str:
     deadline = time.monotonic() + PADDLEOCR_MAX_WAIT_SECONDS
     while True:
         try:
-            response = requests.get(
+            response = httpx.get(
                 f"{PADDLEOCR_JOB_URL}/{job_id}", headers=headers,
                 timeout=PADDLEOCR_TIMEOUT_SECONDS,
             )
             response.raise_for_status()
             data: dict[str, Any] = response.json()["data"]
-        except (requests.RequestException, KeyError, TypeError, ValueError) as error:
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
             raise PaddleOcrServiceError(f"PaddleOCR 任务状态查询失败：{_error_message(error)}") from error
 
         state = data.get("state")

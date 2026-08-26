@@ -39,12 +39,14 @@ logger = logging.getLogger(__name__)
 _MULTI_PRODUCT_LAYOUT_PROMPT = """这是一张私募基金多产品周报/净值报告。请只做页面版面与归属识别，不要推算净值。
 严格输出 JSON：
 {
+  "report_scope":"single_product|multi_product|unknown",
   "product_cards": [{"product_name":"产品全称", "bbox_1000":[l,t,r,b], "confidence":0.0}],
   "legend_items": [{"label":"图例原文", "color_hex":"#RRGGBB", "bbox_1000":[l,t,r,b], "confidence":0.0}],
   "curves": [{"bbox_1000":[l,t,r,b], "color_hex":"#RRGGBB", "legend_label":"对应图例原文", "product_name":"仅在页面明确写明时填写", "confidence":0.0}]
 }
 规则：
-1. bbox_1000 按整页宽高归一化到 0-1000；无法定位填 []，不要猜。
+1. 先判断整页是否包含多个独立产品。只有页面明确出现两个及以上产品名称/产品卡片时 report_scope 才是 multi_product；同一产品的策略对照、基准、累计收益率多条线都属于 single_product。
+2. bbox_1000 按整页宽高归一化到 0-1000；无法定位填 []，不要猜。
 2. 多产品时不要按上下/左右顺序猜曲线归属；只有图例、同一卡片标题或明确连线支持时，product_name 才能填写。
 3. 曲线与产品没有明确关联时 product_name 必须为空字符串。
 4. 不要把策略名、基准、指数、最大回撤或表头当作产品名。
@@ -97,7 +99,13 @@ def extract_multi_product_report(image_bytes: bytes) -> MultiProductReportRespon
     # a missed OCR identity therefore prevented VLM from ever seeing the
     # chart, silently degrading most batch imports to CV-only detection.
     product_cards, legend_items, vlm_curves, vlm_audit = _vlm_layout(image_bytes, metrics)
-    curves = vlm_curves or _curve_candidates(image, metrics)
+    # VLM is useful for semantics but can undercount repeated cards on a long
+    # factsheet.  Keep its candidates and supplement missing panels with the
+    # deterministic chart detector instead of treating a single VLM box as a
+    # complete page layout.
+    report_scope = str(vlm_audit.get("report_scope") or "unknown")
+    cv_curves = _curve_candidates(image, metrics)
+    curves = _merge_curve_candidates(vlm_curves, cv_curves) if report_scope == "multi_product" else _single_chart_candidate(vlm_curves, cv_curves)
     bindings = _bind_curves_to_products(curves, metrics, product_cards, legend_items)
     binding_by_curve = {binding.curve_index: binding for binding in bindings}
     for curve in curves:
@@ -129,6 +137,7 @@ def extract_multi_product_report(image_bytes: bytes) -> MultiProductReportRespon
         legend_items=legend_items,
         curve_bindings=bindings,
         product_identity=identity,
+        report_scope=report_scope,
         vlm_layout_attempted=bool(vlm_audit.get("attempted")),
         vlm_layout_used=bool(vlm_curves),
         vlm_audit=vlm_audit,
@@ -253,6 +262,7 @@ def _vlm_layout(
         "curve_count": len(curves),
         "product_card_count": len(cards),
         "legend_count": len(legends),
+        "report_scope": payload.get("report_scope") if payload.get("report_scope") in {"single_product", "multi_product", "unknown"} else "unknown",
     }
 
 
@@ -283,6 +293,76 @@ def _confidence(value: Any) -> float:
 def _valid_color(value: Any) -> str | None:
     token = str(value or "").strip()
     return token.upper() if re.fullmatch(r"#[0-9A-Fa-f]{6}", token) else None
+
+
+def _merge_curve_candidates(
+    vlm_curves: list[ReportCurveCandidate],
+    cv_curves: list[ReportCurveCandidate],
+) -> list[ReportCurveCandidate]:
+    """Keep semantic VLM boxes and add non-overlapping CV chart panels."""
+    stacked_cards = [
+        candidate for candidate in cv_curves
+        if any(item.startswith("CV") for item in candidate.binding_evidence)
+    ]
+    if stacked_cards:
+        # The VLM usually locates the line itself, while the deterministic
+        # card split includes the title, axes and KPI panel needed for review.
+        # Transfer VLM naming/colour to its containing card and keep one crop
+        # per product instead of showing two boxes for the same product.
+        for card in stacked_cards:
+            matches = [
+                curve for curve in vlm_curves
+                if card.left_ratio <= (curve.left_ratio + curve.right_ratio) / 2 <= card.right_ratio
+                and card.top_ratio <= (curve.top_ratio + curve.bottom_ratio) / 2 <= card.bottom_ratio
+            ]
+            if len(matches) == 1:
+                match = matches[0]
+                card.layout_product_name = match.layout_product_name
+                card.legend_label = match.legend_label
+                card.color_hex = match.color_hex
+                card.binding_confidence = match.binding_confidence
+                card.binding_evidence = match.binding_evidence
+        for index, candidate in enumerate(stacked_cards, start=1):
+            candidate.curve_index = index
+        return stacked_cards
+
+    def overlaps(left: ReportCurveCandidate, right: ReportCurveCandidate) -> bool:
+        intersection_width = max(0.0, min(left.right_ratio, right.right_ratio) - max(left.left_ratio, right.left_ratio))
+        intersection_height = max(0.0, min(left.bottom_ratio, right.bottom_ratio) - max(left.top_ratio, right.top_ratio))
+        intersection = intersection_width * intersection_height
+        if not intersection:
+            return False
+        left_area = (left.right_ratio - left.left_ratio) * (left.bottom_ratio - left.top_ratio)
+        right_area = (right.right_ratio - right.left_ratio) * (right.bottom_ratio - right.top_ratio)
+        return intersection / max(left_area + right_area - intersection, 1e-9) >= 0.55
+
+    merged = list(vlm_curves)
+    for candidate in cv_curves:
+        if not any(overlaps(candidate, existing) for existing in merged):
+            candidate.binding_evidence = [*candidate.binding_evidence, "CV 检出独立业绩区块，待人工确认产品归属"]
+            merged.append(candidate)
+    for index, candidate in enumerate(sorted(merged, key=lambda item: (item.top_ratio, item.left_ratio)), start=1):
+        candidate.curve_index = index
+    return sorted(merged, key=lambda item: (item.top_ratio, item.left_ratio))
+
+
+def _single_chart_candidate(
+    vlm_curves: list[ReportCurveCandidate],
+    cv_curves: list[ReportCurveCandidate],
+) -> list[ReportCurveCandidate]:
+    """A single product may have benchmarks; review its plot once, not per line."""
+    candidates = vlm_curves or cv_curves
+    if not candidates:
+        return []
+    return [ReportCurveCandidate(
+        curve_index=1,
+        left_ratio=max(0, min(item.left_ratio for item in candidates) - 0.03),
+        top_ratio=max(0, min(item.top_ratio for item in candidates) - 0.02),
+        right_ratio=min(1, max(item.right_ratio for item in candidates) + 0.02),
+        bottom_ratio=min(1, max(item.bottom_ratio for item in candidates) + 0.02),
+        binding_confidence=max(item.binding_confidence for item in candidates),
+        binding_evidence=["VLM 整页判定为单产品；多条线作为同图对照复核"],
+    )]
 
 
 def _bind_curves_to_products(
@@ -418,6 +498,7 @@ def _parse_single_product_factsheet(chinese: str, english: str) -> ReportDisclos
 
     start_date = end_date - timedelta(days=365)
     drawdown_match = re.search(r"最大回撤\s*[—:：\s]*(-?\d+(?:\.\d+)?)\s*%", chinese)
+    sharpe_match = re.search(r"(?:夏普(?:比率)?|Sharpe(?:\s*Ratio)?)\s*[—:：\s]*(-?\d+(?:\.\d+)?)", combined, re.IGNORECASE)
     drawdown = float(drawdown_match.group(1)) / 100 if drawdown_match else 0.0
     strategy = _infer_strategy_from_text(chinese)
     return ReportDisclosedMetrics(
@@ -429,6 +510,7 @@ def _parse_single_product_factsheet(chinese: str, english: str) -> ReportDisclos
         annualized_return=float(row_match.group("annual")) / 100,
         maximum_drawdown=drawdown,
         maximum_drawdown_disclosed=drawdown_match is not None,
+        sharpe_ratio=float(sharpe_match.group(1)) if sharpe_match else None,
         strategy=strategy,
     )
 
@@ -564,6 +646,39 @@ def _curve_candidates(image: np.ndarray, metrics: list[ReportDisclosedMetrics]) 
     import cv2
 
     height, width = image.shape[:2]
+    # Some manager factsheets are a vertical stack of equally styled product
+    # cards.  Their red card headings are more reliable separators than the
+    # individual axes, which otherwise cause the detector to return only the
+    # largest three plots or fragments inside a plot.
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    red = ((hsv[:, :, 0] <= 10) | (hsv[:, :, 0] >= 170)) & (hsv[:, :, 1] >= 85) & (hsv[:, :, 2] >= 80)
+    red_counts = red.sum(axis=1)
+    title_rows = red_counts >= max(24, int(width * 0.09))
+    starts: list[int] = []
+    start: int | None = None
+    for y, marked in enumerate(title_rows):
+        if marked and start is None:
+            start = y
+        if start is not None and (not marked or y == height - 1):
+            end = y if not marked else y + 1
+            midpoint = (start + end) // 2
+            if not starts or midpoint - starts[-1] >= height * 0.12:
+                starts.append(midpoint)
+            start = None
+    if len(starts) >= 2:
+        cards: list[ReportCurveCandidate] = []
+        for index, top in enumerate(starts[:4], start=1):
+            next_top = starts[index] if index < len(starts) else height
+            cards.append(ReportCurveCandidate(
+                curve_index=index,
+                product_id=metrics[0].product_id if len(metrics) == 1 else None,
+                left_ratio=0.08,
+                top_ratio=max(0, top - int(height * 0.015)) / height,
+                right_ratio=0.82,
+                bottom_ratio=max(top + int(height * 0.08), next_top - int(height * 0.015)) / height,
+                binding_evidence=["CV 检出纵向产品卡片，待人工确认产品归属"],
+            ))
+        return cards
     try:
         from app.services.chart_extractor.chart_detector import detect_chart_regions
 
@@ -579,7 +694,6 @@ def _curve_candidates(image: np.ndarray, metrics: list[ReportDisclosedMetrics]) 
         for region in regions
         if region.w >= width * 0.35
         and region.w / max(region.h, 1) >= 2.0
-        and region.y < height * 0.65
     ]
     if line_regions:
         line_regions.sort(
@@ -590,28 +704,27 @@ def _curve_candidates(image: np.ndarray, metrics: list[ReportDisclosedMetrics]) 
             ),
             reverse=True,
         )
-        region = line_regions[0]
-        pad_x = max(8, int(region.w * 0.025))
-        pad_y = max(8, int(region.h * 0.08))
-        x0 = max(0, int(region.x) - pad_x)
-        y0 = max(0, int(region.y) - pad_y)
-        x1 = min(width, int(region.x + region.w) + pad_x)
-        y1 = min(height, int(region.y + region.h) + pad_y)
-        return [
-            ReportCurveCandidate(
-                curve_index=1,
+        candidates: list[ReportCurveCandidate] = []
+        for index, region in enumerate(sorted(line_regions, key=lambda item: item.y)[:4], start=1):
+            pad_x = max(8, int(region.w * 0.025))
+            pad_y = max(8, int(region.h * 0.08))
+            x0 = max(0, int(region.x) - pad_x)
+            y0 = max(0, int(region.y) - pad_y)
+            x1 = min(width, int(region.x + region.w) + pad_x)
+            y1 = min(height, int(region.y + region.h) + pad_y)
+            candidates.append(ReportCurveCandidate(
+                curve_index=index,
                 product_id=metrics[0].product_id if len(metrics) == 1 else None,
                 left_ratio=x0 / width,
                 top_ratio=y0 / height,
                 right_ratio=x1 / width,
                 bottom_ratio=y1 / height,
-            )
-        ]
+            ))
+        return candidates
 
     # Fallback for clean chart-only images where the detector has no Hough
     # region.  Keep only substantial, wide components; thin table rules are
     # intentionally excluded.
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     green = (hsv[:, :, 0] >= 35) & (hsv[:, :, 0] <= 90)
     red = (hsv[:, :, 0] <= 10) | (hsv[:, :, 0] >= 170)
     blue = (hsv[:, :, 0] >= 100) & (hsv[:, :, 0] <= 135)
@@ -629,7 +742,7 @@ def _curve_candidates(image: np.ndarray, metrics: list[ReportDisclosedMetrics]) 
         reverse=True,
     )
     curves: list[ReportCurveCandidate] = []
-    for index, stat in enumerate(components[: len(metrics) or 1]):
+    for index, stat in enumerate(components[:4]):
         x, y, component_width, component_height, _ = stat
         curves.append(
             ReportCurveCandidate(

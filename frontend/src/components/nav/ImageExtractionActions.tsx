@@ -1,5 +1,4 @@
 import { Alert, Button, Col, Input, InputNumber, Row, Select, Tooltip, Typography } from "antd";
-import type { ImageExtractionFrequency } from "../../api";
 
 const { Text } = Typography;
 
@@ -16,8 +15,6 @@ export default function ImageExtractionActions({
   onToggleColorPicker,
   reportedCumulativeReturn,
   onReportedCumulativeReturnChange,
-  imageExtractionFrequency,
-  onImageExtractionFrequencyChange,
   onSmartExtract,
   onOpenAdvancedCalibration,
   productName,
@@ -35,8 +32,6 @@ export default function ImageExtractionActions({
   onToggleColorPicker: () => void;
   reportedCumulativeReturn?: number;
   onReportedCumulativeReturnChange: (value: number | undefined) => void;
-  imageExtractionFrequency: ImageExtractionFrequency;
-  onImageExtractionFrequencyChange: (value: ImageExtractionFrequency) => void;
   onSmartExtract: () => void;
   onOpenAdvancedCalibration: () => void;
   productName: string;
@@ -83,12 +78,6 @@ export default function ImageExtractionActions({
         <Col xs={24} sm={7}>
           <div style={{ fontSize: 12, color: "var(--serif-muted-foreground)", marginBottom: 4 }}>披露累计收益 %（可选）</div>
           <InputNumber aria-label="披露累计收益" value={reportedCumulativeReturn} onChange={(value) => onReportedCumulativeReturnChange(value ?? undefined)} min={-100} max={10000} step={0.01} style={{ width: "100%" }} />
-        </Col>
-        <Col xs={24} sm={5}>
-          <div style={{ fontSize: 12, color: "var(--serif-muted-foreground)", marginBottom: 4 }}>图片提取频率</div>
-          <Select<ImageExtractionFrequency> value={imageExtractionFrequency} onChange={onImageExtractionFrequencyChange} style={{ width: "100%" }} options={[
-            { value: "weekly", label: "周频" }, { value: "monthly", label: "月频" }, { value: "daily", label: "日频（仅有明确日频披露时）" }, { value: "auto", label: "自动判断" },
-          ]} />
         </Col>
       </Row>
       </details>

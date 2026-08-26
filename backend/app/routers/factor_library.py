@@ -6,7 +6,13 @@ from datetime import date as dt_date, datetime
 
 from fastapi import APIRouter, HTTPException
 from app.dependencies import akshare_provider, csv_provider
-from app.schemas import FactorAttributionRequest
+from app.schemas import (
+    FactorAttributionRequest,
+    SectorBreakdownRequest,
+    FactorValidateRequest,
+    FactorAlphaRequest,
+    FactorDriftRequest,
+)
 from app.services import factor_library
 
 router = APIRouter(tags=["因子库"])
@@ -291,25 +297,19 @@ def export_factor_library(format: str = "csv") -> dict:
 
 
 @router.post("/api/factor-library/sector-breakdown")
-def sector_breakdown(request: dict) -> dict:
+def sector_breakdown(request: SectorBreakdownRequest) -> dict:
     """Sector-level profit/loss attribution for factors over a date range."""
     from app.services.factor_library.sector_breakdown import compute_all_sector_breakdowns
 
-    start_str = request.get("start")
-    end_str = request.get("end")
-    if not start_str or not end_str:
-        raise HTTPException(status_code=422, detail="start and end are required (ISO date)")
-
     try:
-        start = dt_date.fromisoformat(start_str)
-        end = dt_date.fromisoformat(end_str)
+        start = dt_date.fromisoformat(request.start)
+        end = dt_date.fromisoformat(request.end)
     except ValueError:
         raise HTTPException(status_code=422, detail="Invalid date format; use YYYY-MM-DD")
 
-    factor_names = request.get("factor_names") or None
-    results = compute_all_sector_breakdowns(start, end, factor_names)
+    results = compute_all_sector_breakdowns(start, end, request.factor_names)
 
-    return {"start": start_str, "end": end_str, "factors": results, "count": len(results)}
+    return {"start": request.start, "end": request.end, "factors": results, "count": len(results)}
 
 
 # ---------------------------------------------------------------------------
@@ -407,21 +407,16 @@ def run_factor_attribution(request: FactorAttributionRequest) -> dict:
 
 
 @router.post("/api/factor-library/validate")
-def validate_l1_vs_l4(request: dict) -> dict:
+def validate_l1_vs_l4(request: FactorValidateRequest) -> dict:
     """Compare L1 regression results against L4 weekly report ground truth."""
     from app.services.factor_library.validation import validate_against_report
 
-    regression_result = request.get("regression_result")
-    report_snapshot = request.get("report_snapshot")
+    regression_result = request.regression_result
+    report_snapshot = request.report_snapshot
+    period_returns = request.factor_period_returns
+    period_start = request.period_start
+    period_end = request.period_end
 
-    if not regression_result or not report_snapshot:
-        raise HTTPException(status_code=422, detail="需要同时提供 regression_result 和 report_snapshot")
-
-    period_returns = request.get("factor_period_returns")
-    if period_returns is not None and not isinstance(period_returns, dict):
-        raise HTTPException(status_code=422, detail="factor_period_returns 必须为 {因子名: 同期收益率} 对象")
-    period_start = request.get("period_start")
-    period_end = request.get("period_end")
     if period_returns is None and (period_start or period_end):
         if not period_start or not period_end:
             raise HTTPException(status_code=422, detail="自动计算同期因子收益需要同时提供 period_start 和 period_end")
@@ -467,15 +462,11 @@ def validate_l1_vs_l4(request: dict) -> dict:
 
 
 @router.post("/api/factor-library/alpha")
-def measure_alpha_endpoint(request: dict) -> dict:
+def measure_alpha_endpoint(request: FactorAlphaRequest) -> dict:
     """Compute detailed alpha metrics from a regression result."""
     from app.services.factor_library.validation import measure_alpha
 
-    regression_result = request.get("regression_result")
-    if not regression_result:
-        raise HTTPException(status_code=422, detail="需要提供 regression_result")
-
-    metrics = measure_alpha(regression_result)
+    metrics = measure_alpha(request.regression_result)
 
     return {
         "annualized_alpha": metrics.annualized_alpha,
@@ -492,20 +483,11 @@ def measure_alpha_endpoint(request: dict) -> dict:
 
 
 @router.post("/api/factor-library/drift")
-def detect_drift_endpoint(request: dict) -> dict:
+def detect_drift_endpoint(request: FactorDriftRequest) -> dict:
     """Detect style drift from rolling regression snapshots."""
     from app.services.factor_library.validation import detect_drift
 
-    snapshots = request.get("rolling_snapshots", [])
-    threshold = request.get("threshold_pct", 50.0)
-
-    if len(snapshots) < 10:
-        raise HTTPException(
-            status_code=422,
-            detail=f"滚动快照不足（{len(snapshots)} 个，需 >= 10），请先运行带 rolling_window 的归因",
-        )
-
-    report = detect_drift(snapshots, threshold_pct=threshold)
+    report = detect_drift(request.rolling_snapshots, threshold_pct=request.threshold_pct)
 
     return {
         "n_periods": report.n_periods,

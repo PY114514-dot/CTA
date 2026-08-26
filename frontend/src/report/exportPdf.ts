@@ -4,12 +4,13 @@
  * Extracted from main.tsx for maintainability.
  */
 import { generateMarkdownReport } from "./markdownReport";
+import type { CtaAttributionSnapshotResponse } from "../api";
 import type { HistoryRecord } from "../storage/historyStorage";
 import { downloadAnalysisReportPdf } from "../api";
 
 /** Download a real PDF without relying on popup and print-dialog support. */
-export async function exportPdfReport(record: HistoryRecord): Promise<void> {
-  const md = generateMarkdownReport(record);
+export async function exportPdfReport(record: HistoryRecord, attributionSnapshot?: CtaAttributionSnapshotResponse): Promise<void> {
+  const md = generateMarkdownReport(record, attributionSnapshot);
   const safeName = (record.product_name || "产品").replace(/[\\/:*?"<>|]/g, "_");
   const blob = await downloadAnalysisReportPdf(record.product_name, md);
   const url = URL.createObjectURL(blob);
@@ -96,7 +97,7 @@ export function exportPdfReportWithPrintDialog(record: HistoryRecord): void {
   th { background: #eaf2fb; color: #102a43; }
   hr { border: none; border-top: 1px solid #d9e2ec; margin: 22px 0; }
   @media print { body { max-width: none; } }
-</style></head><body><header>${escapeHtml(record.product_name || "未命名产品")} · 净值分析报告</header>${htmlRows}</body></html>`;
+</style></head><body><header>${escapeHtml(record.product_name || "未命名产品")} · 产品分析报告</header>${htmlRows}</body></html>`;
 
   const printWindow = window.open("", "_blank");
   if (!printWindow) return;

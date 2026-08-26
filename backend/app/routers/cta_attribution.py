@@ -11,17 +11,27 @@ from sqlalchemy.orm import Session
 from app.database import get_session
 from app.models import ConfirmationStatus, DataSnapshot
 from app.services import product_store
-from app.services.cta_attribution_snapshot import MODEL_VERSIONS, build_snapshot_content
+from app.services.cta_attribution_snapshot import MODEL_VERSIONS
+from app.services.cta_attribution_evidence import load_latest_phase_d_evidence_payload
+from app.services.phase_d_batch import (
+    freeze_attribution_snapshot,
+    get_batch_runner,
+    list_phase_d_batch_candidates,
+)
 from app.services.cta_evaluation import build_attribution_tables, evaluate_nav_path
+from app.services.cta_factor_bundle import CTA_FACTOR_NAMES, COMMODITY_ARBITRAGE_FACTOR_NAMES, get_cta_factor_bundle, get_factor_series
 from app.services.dynamic_beta import (
     DYNAMIC_FACTOR_NAMES,
+    INTERACTION_FACTOR_NAMES,
     compute_rolling_beta,
     filter_dynamic_beta,
     prepare_factor_matrix,
 )
 from app.services.regime_attribution import classify_observable_regimes, run_regime_attribution
-from app.services.nonlinear_attribution import evaluate_nonlinear_increment
-from app.services.factor_library.factor_regression import run_factor_regression
+from app.services.nonlinear_attribution import evaluate_factor_interaction_increment, evaluate_momentum_volatility_increment
+from app.services.factor_library.factor_regression import assess_oos_applicability, run_factor_regression
+from app.services.candidate_factor_gate import evaluate_candidate_factor
+from app.services.attribution_applicability import select_attribution_contract
 
 router = APIRouter(prefix="/api/cta-attribution", tags=["CTA 动态归因"])
 
@@ -42,6 +52,26 @@ def _phase_function(phase: str):
     }.get(phase)
 
 
+def _cta_contract_or_error(product, reviewed_nav_count: int) -> dict:
+    applicability = select_attribution_contract(product, reviewed_nav_count)
+    if applicability["status"] not in {"applicable", "observe_only"}:
+        raise HTTPException(422, applicability["reason"])
+    return applicability
+
+
+@router.get("/products/{product_id}/applicability")
+def get_model_applicability(product_id: str, session: Session = Depends(get_session)) -> dict:
+    """Return the selected factor contract without running a regression."""
+    product = product_store.get_product(session, product_id)
+    if product is None:
+        raise HTTPException(404, "产品不存在")
+    observations = product_store.get_nav_series(session, product_id, reviewed_only=True)
+    reviewed_count = len(observations)
+    return {"product_id": product.id, "product_name": product.standard_name,
+            "reviewed_nav_count": reviewed_count,
+            **select_attribution_contract(product, reviewed_count, as_of_date=observations[-1].observation_date if observations else None)}
+
+
 @router.get("/products/{product_id}/phase-a")
 def evaluate_reviewed_product(product_id: str, session: Session = Depends(get_session)) -> dict:
     """Never parses files: evaluates only confirmed, human-reviewed NAV."""
@@ -53,15 +83,24 @@ def evaluate_reviewed_product(product_id: str, session: Session = Depends(get_se
     observations = product_store.get_nav_series(session, product_id, reviewed_only=True)
     if len(observations) < 20:
         raise HTTPException(422, "至少需要 20 条已审核净值才能进行 Phase A 评价")
+    applicability = _cta_contract_or_error(product, len(observations))
     frequency = product.nav_frequency or observations[0].frequency or "weekly"
     if frequency not in {"daily", "weekly", "monthly"}:
         raise HTTPException(422, "净值频率必须为 daily、weekly 或 monthly")
     dates = [item.observation_date for item in observations]
     navs = [float(item.nav) for item in observations]
     returns = [right / left - 1.0 for left, right in zip(navs, navs[1:])]
+    bundle_cutoff = max(dates[1:])
+    factor_bundle = get_cta_factor_bundle(as_of_date=bundle_cutoff)
+    candidate_gate = _candidate_gate(product.strategy, product.strategy_disclosure, returns, dates[1:], frequency)
+    factor_names = list(CTA_FACTOR_NAMES)
+    if candidate_gate and candidate_gate["admitted"]:
+        factor_names.append(candidate_gate["candidate_name"])
     try:
         regression = run_factor_regression(
             product_returns=np.asarray(returns), product_dates=dates[1:], frequency=frequency,
+            factor_names=factor_names,
+            factor_series_loader=lambda name: get_factor_series(name, as_of_date=bundle_cutoff),
             rolling_window={"daily": 60, "weekly": 26, "monthly": 12}[frequency],
             oos_train_window={"daily": 60, "weekly": 26, "monthly": 24}[frequency],
             minimum_observations=19,
@@ -74,12 +113,44 @@ def evaluate_reviewed_product(product_id: str, session: Session = Depends(get_se
                           "source": "confirmed + reviewed NAV only", "parsing_triggered": False},
         "performance_path": evaluate_nav_path(navs, dates, frequency),
         "attribution": build_attribution_tables(regression),
+        "factor_bundle": factor_bundle,
         "baseline": {"r_squared": regression.r_squared, "adj_r_squared": regression.adj_r_squared,
                      "annualized_alpha_candidate": regression.annualized_alpha, "out_of_sample": regression.out_of_sample,
-                     "warnings": regression.warnings},
+                     "validation": assess_oos_applicability(regression.out_of_sample), "warnings": regression.warnings},
+        "candidate_factor_gate": candidate_gate,
+        "model_applicability": applicability,
         "warnings": ["收益贡献、因子暴露和 Euler 风险贡献为不同统计对象，不代表真实持仓或真实 P&L。",
                      "当前阶段未纳入持仓、成交、费用、容量或交易成本数据。"],
     }
+
+
+def _candidate_factor_names_for_product(strategy: str | None, disclosure: dict | None = None) -> tuple[str, ...]:
+    arbitrage_type = (disclosure or {}).get("arbitrage_type")
+    if arbitrage_type is not None:
+        if arbitrage_type not in {"跨期", "期限结构", "混合"}:
+            return ()
+        return tuple(name for name in COMMODITY_ARBITRAGE_FACTOR_NAMES if name not in CTA_FACTOR_NAMES)
+    normalized = (strategy or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {"商品套利", "commodity_arbitrage", "commodity_spread_arbitrage"}:
+        return tuple(name for name in COMMODITY_ARBITRAGE_FACTOR_NAMES if name not in CTA_FACTOR_NAMES)
+    return ()
+
+
+def _candidate_gate(strategy: str | None, disclosure: dict | None, returns: list[float], dates: list[date], frequency: str) -> dict | None:
+    candidates = _candidate_factor_names_for_product(strategy, disclosure)
+    if not candidates:
+        return None
+    from app.services.dynamic_beta import prepare_factor_matrix
+
+    try:
+        aligned = prepare_factor_matrix(
+            np.asarray(returns), dates, frequency, list(CTA_FACTOR_NAMES + candidates),
+        )
+    except ValueError as error:
+        return {"candidate_name": candidates[0], "status": "insufficient", "admitted": False, "segments": [], "summary": {}, "rule": "至少 3 个连续样本外段。", "conclusion": str(error)}
+    return evaluate_candidate_factor(
+        aligned["returns"], aligned["factor_returns"], aligned["dates"], aligned["factor_names"], candidates[0],
+    )
 
 
 @router.get("/products/{product_id}/phase-b")
@@ -93,6 +164,7 @@ def evaluate_dynamic_product(product_id: str, session: Session = Depends(get_ses
     observations = product_store.get_nav_series(session, product_id, reviewed_only=True)
     if len(observations) < 20:
         raise HTTPException(422, "至少需要 20 条已审核净值才能进行 Phase B 动态归因")
+    _cta_contract_or_error(product, len(observations))
     frequency = product.nav_frequency or observations[0].frequency or "weekly"
     if frequency not in {"daily", "weekly", "monthly"}:
         raise HTTPException(422, "净值频率必须为 daily、weekly 或 monthly")
@@ -152,6 +224,7 @@ def evaluate_regime_product(product_id: str, session: Session = Depends(get_sess
     observations = product_store.get_nav_series(session, product_id, reviewed_only=True)
     if len(observations) < 20:
         raise HTTPException(422, "至少需要 20 条已审核净值才能进行 Phase C 状态归因")
+    _cta_contract_or_error(product, len(observations))
     frequency = product.nav_frequency or observations[0].frequency or "weekly"
     if frequency not in {"daily", "weekly", "monthly"}:
         raise HTTPException(422, "净值频率必须为 daily、weekly 或 monthly")
@@ -215,6 +288,7 @@ def evaluate_nonlinear_product(product_id: str, session: Session = Depends(get_s
     observations = product_store.get_nav_series(session, product_id, reviewed_only=True)
     if len(observations) < 20:
         raise HTTPException(422, "至少需要 20 条已审核净值才能进行 Phase D 非线性归因")
+    _cta_contract_or_error(product, len(observations))
     frequency = product.nav_frequency or observations[0].frequency or "weekly"
     if frequency not in {"daily", "weekly", "monthly"}:
         raise HTTPException(422, "净值频率必须为 daily、weekly 或 monthly")
@@ -225,9 +299,11 @@ def evaluate_nonlinear_product(product_id: str, session: Session = Depends(get_s
     train_window = {"daily": 60, "weekly": 26, "monthly": 12}[frequency]
     test_window = {"daily": 20, "weekly": 12, "monthly": 6}[frequency]
     try:
-        aligned = prepare_factor_matrix(returns, return_dates, frequency, DYNAMIC_FACTOR_NAMES)
-        nonlinear = evaluate_nonlinear_increment(
-            aligned["returns"], aligned["factor_returns"], aligned["dates"], aligned["factor_names"],
+        aligned = prepare_factor_matrix(returns, return_dates, frequency, INTERACTION_FACTOR_NAMES)
+        if aligned["factor_names"] != list(INTERACTION_FACTOR_NAMES):
+            raise ValueError("动量 × 波动率主效应因子不完整，拒绝交互检验")
+        nonlinear = evaluate_momentum_volatility_increment(
+            aligned["returns"], aligned["factor_returns"], aligned["dates"],
             frequency=frequency, train_window=train_window, test_window=test_window,
             max_segments=5, min_segments=3, min_r2_uplift=0.01,
         )
@@ -235,6 +311,93 @@ def evaluate_nonlinear_product(product_id: str, session: Session = Depends(get_s
         raise HTTPException(422, f"非线性增量数据不足：{error}") from error
     except Exception as error:
         raise HTTPException(500, f"非线性增量计算失败：{error}") from error
+
+    def scenario_check(
+        *,
+        key: str,
+        title: str,
+        description: str,
+        factor_names: tuple[str, str],
+        interaction_name: str,
+        use_prior_drawdown: bool = False,
+        source_factor_names: tuple[str, ...] | None = None,
+    ) -> dict:
+        try:
+            requested_factors = source_factor_names or factor_names
+            scenario_aligned = prepare_factor_matrix(returns, return_dates, frequency, requested_factors)
+            if scenario_aligned["factor_names"] != list(requested_factors):
+                raise ValueError("所需因子未完整覆盖")
+            scenario_factors = scenario_aligned["factor_returns"]
+            if use_prior_drawdown:
+                prior_nav = np.r_[1.0, np.cumprod(1.0 + scenario_aligned["returns"])[:-1]]
+                prior_peak = np.maximum.accumulate(prior_nav)
+                scenario_factors = np.column_stack([scenario_factors[:, 0], prior_nav / prior_peak - 1.0])
+            check = evaluate_factor_interaction_increment(
+                scenario_aligned["returns"],
+                scenario_factors,
+                scenario_aligned["dates"],
+                factor_names=factor_names,
+                interaction_name=interaction_name,
+                display_name=title,
+                frequency=frequency,
+                train_window=train_window,
+                test_window=test_window,
+                max_segments=5,
+                min_segments=3,
+                min_r2_uplift=0.01,
+            )
+            summary = check["summary"]
+            return {
+                "key": key,
+                "title": title,
+                "description": description,
+                "status": check["status"],
+                "stable": summary["stable_improvement"],
+                "conclusion": summary["conclusion"],
+                "evaluated_segments": summary["evaluated_delta_count"],
+                "positive_fraction": summary["positive_delta_fraction"],
+                "mean_r2_delta": summary["mean_r2_delta"],
+                "details": check,
+            }
+        except ValueError as error:
+            return {
+                "key": key,
+                "title": title,
+                "description": description,
+                "status": "insufficient",
+                "stable": False,
+                "conclusion": f"暂无法验证：{error}",
+                "evaluated_segments": 0,
+                "positive_fraction": None,
+                "mean_r2_delta": None,
+                "details": None,
+            }
+
+    scenario_checks = [
+        scenario_check(
+            key="trend_agreement",
+            title="趋势协同",
+            description="检验长短趋势同时明显时，产品是否出现更稳定的趋势特征。",
+            factor_names=("trend", "short_term_trend_20"),
+            interaction_name="trend_x_short_term_trend",
+        ),
+        scenario_check(
+            key="trend_carry",
+            title="趋势与期限结构",
+            description="检验不同期限结构下，趋势特征是否出现稳定变化。",
+            factor_names=("trend", "term_structure_carry"),
+            interaction_name="trend_x_term_structure_carry",
+        ),
+        scenario_check(
+            key="drawdown_recovery",
+            title="回撤后的趋势修复",
+            description="检验产品经历自身回撤后，趋势行情是否带来更稳定的修复表现。",
+            factor_names=("trend", "prior_drawdown"),
+            interaction_name="trend_x_prior_drawdown",
+            use_prior_drawdown=True,
+            source_factor_names=("trend",),
+        ),
+    ]
     return {
         "product_id": product.id,
         "product_name": product.standard_name,
@@ -253,6 +416,7 @@ def evaluate_nonlinear_product(product_id: str, session: Session = Depends(get_s
             "end_date": aligned["dates"][-1].isoformat(),
         },
         "nonlinear_increment": nonlinear,
+        "scenario_checks": scenario_checks,
         "warnings": aligned["warnings"] + [
             "非线性层只报告固定因子集合上的连续 OOS 预测增量，不将训练集拟合或模型重要性写成收益归因。",
             "无稳定 OOS 增益时保留线性基线，不升级为非线性结论。",
@@ -266,40 +430,41 @@ def create_cta_attribution_snapshot(
     session: Session = Depends(get_session),
 ) -> dict:
     """Compute one phase and persist an immutable, idempotent result."""
-    product = product_store.get_product(session, body.product_id)
-    if product is None:
-        raise HTTPException(404, "产品不存在")
-    phase_function = _phase_function(body.phase)
-    if phase_function is None:  # Defensive guard for future route changes.
-        raise HTTPException(422, "不支持的 CTA 归因阶段")
-    try:
-        result = phase_function(body.product_id, session)
-    except HTTPException:
-        raise
-    observations = product_store.get_nav_series(session, body.product_id, reviewed_only=True)
-    if not observations:
-        raise HTTPException(422, "没有可用于快照的已审核净值")
-    label, model_version, content = build_snapshot_content(
-        phase=body.phase, product=product, observations=observations, result=result,
-    )
-    existing = session.execute(
-        select(DataSnapshot).where(DataSnapshot.label == label).limit(1)
-    ).scalars().first()
-    snapshot = existing or product_store.create_snapshot(session, label=label, content=content)
-    frozen = snapshot.content
-    return {
-        "snapshot_id": snapshot.id,
-        "created_at": snapshot.created_at.isoformat() if snapshot.created_at else None,
-        "snapshot_type": "cta_dynamic_attribution",
-        "phase": body.phase,
-        "model_version": model_version,
-        "product_id": frozen.get("product_id"),
-        "as_of_date": frozen.get("as_of_date"),
-        "nav_fingerprint": frozen.get("nav_fingerprint"),
-        "factor_data_version": frozen.get("factor_data_version"),
-        "result": frozen.get("results", {}),
-        "idempotent": existing is not None,
-    }
+    return freeze_attribution_snapshot(session, body.product_id, body.phase)
+
+
+class PhaseDBatchRequest(BaseModel):
+    """Trigger background Phase-D evidence generation for a product set."""
+
+    product_ids: list[str] = Field(default_factory=list, max_length=2000)
+    concurrency: int = Field(default=4, ge=1, le=16)
+
+
+@router.post("/phase-d/refresh-batch")
+def refresh_phase_d_batch(
+    body: PhaseDBatchRequest | None = None,
+    session: Session = Depends(get_session),
+) -> dict:
+    """启动后台批量生成 Phase-D 证据快照（幂等，已冻结的产品直接复用）。
+
+    不传 product_ids 时默认为全部 confirmed + weekly 产品。任务在后台
+    线程池运行，进度通过 GET /phase-d/batch-status 查询。
+    """
+    body = body or PhaseDBatchRequest()
+    if body.product_ids:
+        candidates = body.product_ids
+    else:
+        candidates = list_phase_d_batch_candidates(session)
+    runner = get_batch_runner()
+    if runner.status()["status"] == "running":
+        return {**runner.status(), "note": "批量任务已在运行，未重复启动。"}
+    return runner.start(candidates, concurrency=body.concurrency)
+
+
+@router.get("/phase-d/batch-status")
+def phase_d_batch_status() -> dict:
+    """返回后台 Phase-D 批量任务的可见性快照（当前对象/并行/排队）。"""
+    return get_batch_runner().status()
 
 
 @router.get("/snapshots")
@@ -348,77 +513,17 @@ def list_latest_phase_d_evidence(
 
     ``product_ids`` is a comma-separated list supplied by the ranking caller.
     Only the newest snapshot whose own NAV cutoff is not after the requested
-    ranking cutoff is returned for each product.
+    ranking cutoff is returned for each product.  The selection logic lives in
+    ``cta_attribution_evidence.load_latest_phase_d_evidence_payload`` so the
+    ranking refresh path and this endpoint cannot drift apart.
     """
     requested_ids = {
         value.strip() for value in (product_ids or "").split(",") if value.strip()
     }
-    cutoff = as_of_date
-    statement = select(DataSnapshot).where(DataSnapshot.label.like("cta-attribution:phase-d:%"))
-    snapshots = session.execute(
-        statement.order_by(DataSnapshot.created_at.desc())
-    ).scalars().all()
-    selected: dict[str, tuple[date, DataSnapshot]] = {}
-    for snapshot in snapshots:
-        content = snapshot.content or {}
-        product_id = str(content.get("product_id", ""))
-        if requested_ids and product_id not in requested_ids:
-            continue
-        snapshot_date_raw = content.get("as_of_date")
-        if not product_id or not snapshot_date_raw:
-            continue
-        try:
-            snapshot_date = date.fromisoformat(str(snapshot_date_raw))
-        except ValueError:
-            continue
-        if cutoff is not None and snapshot_date > cutoff:
-            continue
-        previous = selected.get(product_id)
-        if previous is not None and snapshot_date <= previous[0]:
-            continue
-        selected[product_id] = (snapshot_date, snapshot)
-
-    result: dict[str, dict] = {}
-    for product_id, (snapshot_date, snapshot) in selected.items():
-        content = snapshot.content or {}
-        nonlinear = content.get("results", {}).get("nonlinear_increment", {})
-        summary = nonlinear.get("summary", {})
-        sensitivity = nonlinear.get("sensitivity", {})
-        selection_policy = sensitivity.get("selection_policy", {})
-        parameters = nonlinear.get("parameters", {})
-        result[product_id] = {
-            "source": "immutable_phase_d_snapshot",
-            "snapshot_id": snapshot.id,
-            "model_version": content.get("model_version", MODEL_VERSIONS["phase-d"]),
-            "nav_value_signature": content.get("nav_fingerprint", ""),
-            "as_of_date": snapshot_date.isoformat(),
-            "observation_count": int(content.get("parameters", {}).get("reviewed_nav_count", 0)),
-            "status": str(nonlinear.get("status", "insufficient")),
-            "evaluated_segments": int(summary.get("evaluated_delta_count", 0)),
-            "minimum_segments": int(parameters.get("min_segments", 1)),
-            "stable_improvement": bool(summary.get("stable_improvement", False)),
-            "sensitivity_stable": _phase_d_sensitivity_is_stable(sensitivity),
-            "selected_from_sensitivity": bool(selection_policy.get("selected_from_sensitivity", False)),
-        }
-    return result
-
-
-def _phase_d_sensitivity_is_stable(sensitivity: dict) -> bool:
-    """Require every reported sensitivity scenario to be available and stable."""
-    if not sensitivity:
-        return False
-    scenarios = []
-    for key in ("window_sensitivity", "threshold_sensitivity", "model_parameter_sensitivity"):
-        family = sensitivity.get(key, [])
-        if not isinstance(family, list) or not family:
-            return False
-        scenarios.extend(item for item in family if isinstance(item, dict))
-    if len(scenarios) == 0:
-        return False
-    return all(
-        item.get("status") in {None, "available"}
-        and bool(item.get("stable_improvement", False))
-        for item in scenarios
+    return load_latest_phase_d_evidence_payload(
+        session,
+        product_ids=requested_ids or None,
+        as_of_date=as_of_date,
     )
 
 

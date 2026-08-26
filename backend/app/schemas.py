@@ -6,7 +6,26 @@ frontend, avoiding coupling API evolution to a single locale.
 
 from datetime import date
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
+
+
+# ---------------------------------------------------------------------------
+# Reusable date-ordering validators (shared by many request schemas)
+# ---------------------------------------------------------------------------
+
+
+def _validate_dates_sorted(dates: list[date], field_name: str = "nav_points") -> None:
+    """Raise if *dates* are not in strictly increasing order (duplicates allowed)."""
+    if dates != sorted(dates):
+        raise ValueError(f"{field_name} must be ordered by observation_date")
+
+
+def _validate_dates_strict(dates: list[date], field_name: str = "nav_points") -> None:
+    """Raise if *dates* are not strictly increasing or contain duplicates."""
+    if dates != sorted(dates):
+        raise ValueError(f"{field_name} must be ordered by observation_date")
+    if len(dates) != len(set(dates)):
+        raise ValueError(f"{field_name} must not contain duplicate dates")
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -45,11 +64,9 @@ class NavAnalysisRequest(BaseModel):
     @model_validator(mode="after")
     def validate_chronological_dates(self) -> "NavAnalysisRequest":
         """Require strictly increasing dates to prevent misleading returns."""
-        observation_dates = [point.observation_date for point in self.nav_points]
-        if observation_dates != sorted(observation_dates):
-            raise ValueError("nav_points must be ordered by observation_date")
-        if len(observation_dates) != len(set(observation_dates)):
-            raise ValueError("nav_points must not contain duplicate dates")
+        _validate_dates_strict(
+            [p.observation_date for p in self.nav_points], "nav_points"
+        )
         return self
 
 
@@ -93,6 +110,57 @@ class NavImageDigitizationResponse(BaseModel):
     # Carries the CV trace back to the browser so the user can compare it with
     # the original line.  It is evidence only, not a reviewed NAV series.
     candidate_curve: list[ChartCurvePoint] = Field(default_factory=list)
+
+
+class DigitizationAuditRequest(BaseModel):
+    """Compare OCR-digitized candidate NAV against a human-verified reference.
+
+    批次 13（精度）：数字化是候选值而非真值，抽样审计把候选序列与人工
+    核对过的基准序列逐日对齐，量化提取误差并给出 pass/review/fail 判定。
+    """
+
+    digitized_points: list[NetAssetValuePoint] = Field(min_length=1)
+    reference_points: list[NetAssetValuePoint] = Field(min_length=1)
+    relative_tolerance: float = Field(default=0.01, gt=0, le=1)
+    min_matched: int = Field(default=5, ge=2)
+
+
+class DigitizationWorstPoint(BaseModel):
+    """One matched date with the largest relative digitization error."""
+
+    observation_date: date
+    digitized: float
+    reference: float
+    abs_error: float
+    relative_error: float
+
+
+class DigitizationAuditErrors(BaseModel):
+    """Aggregated error statistics over date-matched pairs."""
+
+    mae: float | None
+    rmse: float | None
+    max_abs_error: float | None
+    mean_relative_error: float | None
+    median_relative_error: float | None
+    max_relative_error: float | None
+    within_tolerance_count: int
+    within_tolerance_ratio: float | None
+
+
+class DigitizationAuditReport(BaseModel):
+    """Sampling-error audit verdict with the evidence behind it."""
+
+    method: str
+    matched_count: int
+    unmatched_digitized_count: int
+    uncovered_reference_count: int
+    sample_coverage_ratio: float | None
+    errors: DigitizationAuditErrors
+    worst_points: list[DigitizationWorstPoint]
+    verdict: Literal["pass", "review", "fail"]
+    verdict_rule: dict[str, Any]
+    warnings: list[str] = Field(default_factory=list)
 
 
 class FactorReturnSeries(BaseModel):
@@ -180,6 +248,7 @@ class ReportDisclosedMetrics(BaseModel):
     cumulative_return: float
     annualized_return: float
     maximum_drawdown: float
+    sharpe_ratio: float | None = None
     # Some factsheets publish recent-year return/annualized return but do not
     # publish maximum drawdown.  Keep the numeric field for backwards
     # compatibility while making the absence explicit to callers; a zero in
@@ -251,6 +320,7 @@ class MultiProductReportResponse(BaseModel):
     legend_items: list[ReportLegendItem] = Field(default_factory=list)
     curve_bindings: list[ReportCurveBinding] = Field(default_factory=list)
     product_identity: ReportProductIdentity = Field(default_factory=ReportProductIdentity)
+    report_scope: str = "unknown"  # single_product | multi_product | unknown
     vlm_layout_attempted: bool = False
     vlm_layout_used: bool = False
     # Persisted provenance for the ingestion audit.  "attempted" means an
@@ -340,9 +410,7 @@ class StrategyClassifyRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_chronological(self) -> "StrategyClassifyRequest":
-        dates = [p.observation_date for p in self.nav_points]
-        if dates != sorted(dates):
-            raise ValueError("nav_points must be ordered by observation_date")
+        _validate_dates_sorted([p.observation_date for p in self.nav_points])
         return self
 
 
@@ -371,9 +439,7 @@ class FactorAnalysisRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_chronological(self) -> "FactorAnalysisRequest":
-        dates = [p.observation_date for p in self.nav_points]
-        if dates != sorted(dates):
-            raise ValueError("nav_points must be ordered by observation_date")
+        _validate_dates_sorted([p.observation_date for p in self.nav_points])
         return self
 
 
@@ -455,9 +521,7 @@ class VarietyIdentifyRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_chronological(self) -> "VarietyIdentifyRequest":
-        dates = [p.observation_date for p in self.nav_points]
-        if dates != sorted(dates):
-            raise ValueError("nav_points must be ordered by observation_date")
+        _validate_dates_sorted([p.observation_date for p in self.nav_points])
         return self
 
 
@@ -522,9 +586,7 @@ class ReportGenerateRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_chronological(self) -> "ReportGenerateRequest":
-        dates = [p.observation_date for p in self.nav_points]
-        if dates != sorted(dates):
-            raise ValueError("nav_points must be ordered by observation_date")
+        _validate_dates_sorted([p.observation_date for p in self.nav_points])
         return self
 
 
@@ -553,9 +615,7 @@ class DeepAttributionRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_chronological(self) -> "DeepAttributionRequest":
-        dates = [point.observation_date for point in self.nav_points]
-        if dates != sorted(dates) or len(dates) != len(set(dates)):
-            raise ValueError("nav_points must be strictly ordered without duplicate dates")
+        _validate_dates_strict([point.observation_date for point in self.nav_points])
         return self
 
 
@@ -580,6 +640,8 @@ class LlmConfigResponse(BaseModel):
     provider: str = ""  # e.g. "deepseek", "doubao", "openai"
     model: str = ""
     api_base_configured: bool = False
+    thinking_enabled: bool = False
+    max_tokens: int = Field(default=900, ge=128, le=1200)
 
 
 class LlmConfigUpdateRequest(BaseModel):
@@ -588,6 +650,8 @@ class LlmConfigUpdateRequest(BaseModel):
     api_base: str = Field(default="")
     api_key: str = Field(default="")
     model: str = Field(default="deepseek-v4-flash")
+    thinking_enabled: bool = False
+    max_tokens: int = Field(default=900, ge=128, le=1200)
 
 
 # ---------------------------------------------------------------------------
@@ -667,9 +731,7 @@ class CtaRankingMarketSeries(BaseModel):
 
     @model_validator(mode="after")
     def validate_chronological_dates(self) -> "CtaRankingMarketSeries":
-        dates = [point.observation_date for point in self.points]
-        if dates != sorted(dates) or len(dates) != len(set(dates)):
-            raise ValueError("market series dates must be strictly ordered without duplicates")
+        _validate_dates_strict([point.observation_date for point in self.points], "market series dates")
         return self
 
 
@@ -681,12 +743,11 @@ class CtaRankingProductInput(BaseModel):
     nav_points: list[NetAssetValuePoint] = Field(min_length=2)
     frequency: DataFrequency
     strategy: str | None = Field(default=None, max_length=80)
+    factor_exposures: dict[str, float] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_chronological_dates(self) -> "CtaRankingProductInput":
-        dates = [point.observation_date for point in self.nav_points]
-        if dates != sorted(dates) or len(dates) != len(set(dates)):
-            raise ValueError("product NAV dates must be strictly ordered without duplicates")
+        _validate_dates_strict([point.observation_date for point in self.nav_points], "product NAV dates")
         return self
 
 
@@ -716,14 +777,16 @@ class CtaRankingAttributionEvidence(BaseModel):
 class CtaRankingRequest(BaseModel):
     """Input for one reproducible CODEX CTA cross-sectional ranking run."""
 
-    products: list[CtaRankingProductInput] = Field(min_length=1, max_length=200)
+    products: list[CtaRankingProductInput] = Field(min_length=1, max_length=1000)
     market_series: list[CtaRankingMarketSeries] = Field(default_factory=list, max_length=20)
     as_of_date: date | None = None
     annual_risk_free_rate: float = Field(default=0.015, ge=-1, le=1)
     model_version: str = Field(default="codex-cta-score-v1.1", min_length=1, max_length=64)
     attribution_evidence: dict[str, CtaRankingAttributionEvidence] = Field(
         default_factory=dict,
-        max_length=200,
+        # 上限与 products 一致：周度宇宙约 750 只产品，证据按产品一一对应，
+        # 原 200 上限会把大部分产品的稳健性证据截断在外。
+        max_length=1000,
     )
 
     @model_validator(mode="after")
@@ -749,8 +812,10 @@ class CtaRankingDimensionScore(BaseModel):
     dimension: str
     label: str
     weight: float = Field(ge=0, le=100)
-    raw_score: float = Field(ge=0, le=100)
-    adjusted_score: float = Field(ge=0, le=100)
+    raw_score: float | None = Field(default=None, ge=0, le=100)
+    adjusted_score: float | None = Field(default=None, ge=0, le=100)
+    metric_count: int = Field(ge=0)
+    covered_metric_count: int = Field(ge=0)
     metric_scores: dict[str, float] = Field(default_factory=dict)
     metric_values: dict[str, float | None] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
@@ -814,6 +879,83 @@ class CtaRankingSnapshotResponse(BaseModel):
     ranking: CtaRankingResponse
 
 
+class CtaPortfolioPosition(BaseModel):
+    """One explicit current-portfolio holding for allocation analysis."""
+
+    product_id: str = Field(min_length=1, max_length=80)
+    weight: float = Field(gt=0, le=1)
+
+
+class CtaProductScoreRequest(BaseModel):
+    """Quality/confidence report with an optional explicit allocation case."""
+
+    products: list[CtaRankingProductInput] = Field(min_length=1, max_length=1000)
+    as_of_date: date | None = None
+    annual_risk_free_rate: float = Field(default=0.015, ge=-1, le=1)
+    market_series: list[CtaRankingMarketSeries] = Field(default_factory=list, max_length=20)
+    current_portfolio: list[CtaPortfolioPosition] = Field(default_factory=list, max_length=100)
+    candidate_product_id: str | None = Field(default=None, min_length=1, max_length=80)
+    candidate_weight: float | None = Field(default=None, gt=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_allocation_case(self) -> "CtaProductScoreRequest":
+        product_ids = {product.product_id for product in self.products}
+        if len(product_ids) != len(self.products):
+            raise ValueError("产品池中的 product_id 必须唯一")
+        position_ids = [position.product_id for position in self.current_portfolio]
+        if len(position_ids) != len(set(position_ids)):
+            raise ValueError("当前组合中的 product_id 必须唯一")
+        unknown_positions = set(position_ids) - product_ids
+        if unknown_positions:
+            raise ValueError("当前组合产品必须属于产品池")
+        allocation_fields_present = bool(self.current_portfolio or self.candidate_product_id or self.candidate_weight is not None)
+        if not allocation_fields_present:
+            return self
+        if not self.current_portfolio or self.candidate_product_id is None or self.candidate_weight is None:
+            raise ValueError("配置分必须同时提供当前组合、候选产品和候选权重")
+        if self.candidate_product_id not in product_ids:
+            raise ValueError("候选产品必须属于产品池")
+        if self.candidate_product_id in position_ids:
+            raise ValueError("候选产品不能同时作为当前组合持仓")
+        if abs(sum(position.weight for position in self.current_portfolio) - 1.0) > 1e-6:
+            raise ValueError("当前组合权重之和必须为 1")
+        return self
+
+
+class CtaFamaProductInput(BaseModel):
+    """Point-in-time product record used only by the CTA-Fama research gate."""
+
+    product_id: str = Field(min_length=1, max_length=80)
+    frequency: DataFrequency
+    nav_points: list[NetAssetValuePoint] = Field(min_length=2)
+    source_group: str = Field(min_length=1, max_length=120)
+    exit_date: date | None = None
+    point_in_time_verified: bool = False
+
+    @model_validator(mode="after")
+    def validate_nav_dates(self) -> "CtaFamaProductInput":
+        _validate_dates_strict([point.observation_date for point in self.nav_points], "CTA-Fama 净值日期")
+        return self
+
+
+class CtaFamaReadinessRequest(BaseModel):
+    """Dataset audit inputs for the post-production CTA-Fama research gate."""
+
+    products: list[CtaFamaProductInput] = Field(min_length=1, max_length=1000)
+    exit_history_complete: bool = False
+    survivorship_audit_passed: bool = False
+    backfill_audit_passed: bool = False
+    same_source_deduplicated: bool = False
+    oos_state_segments: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_product_ids(self) -> "CtaFamaReadinessRequest":
+        ids = [product.product_id for product in self.products]
+        if len(ids) != len(set(ids)):
+            raise ValueError("CTA-Fama 产品 ID 必须唯一")
+        return self
+
+
 # ---------------------------------------------------------------------------
 # FOF recommendation agent
 # ---------------------------------------------------------------------------
@@ -838,9 +980,7 @@ class FofFundInput(BaseModel):
 
     @model_validator(mode="after")
     def validate_chronological_dates(self) -> "FofFundInput":
-        dates = [point.observation_date for point in self.nav_points]
-        if dates != sorted(dates) or len(dates) != len(set(dates)):
-            raise ValueError("fund nav_points must be strictly ordered without duplicate dates")
+        _validate_dates_strict([point.observation_date for point in self.nav_points], "fund nav_points")
         return self
 
 
@@ -921,3 +1061,39 @@ class FofRecommendationResponse(BaseModel):
         "本结果基于调用方提供的历史净值和预设规则生成，未接入实时数据，"
         "不构成投资建议、募集推介或适当性结论。请结合尽调、流动性、费用和合规信息复核。"
     )
+
+
+# ---------------------------------------------------------------------------
+# Factor library — typed request bodies (replaces bare dict parameters)
+# ---------------------------------------------------------------------------
+
+
+class SectorBreakdownRequest(BaseModel):
+    """Sector-level profit/loss attribution for factors over a date range."""
+
+    start: str = Field(min_length=1, description="ISO date (YYYY-MM-DD)")
+    end: str = Field(min_length=1, description="ISO date (YYYY-MM-DD)")
+    factor_names: list[str] | None = Field(default=None, description="Subset of factors (None = all)")
+
+
+class FactorValidateRequest(BaseModel):
+    """Compare L1 regression results against L4 weekly report ground truth."""
+
+    regression_result: dict[str, Any]
+    report_snapshot: dict[str, Any]
+    factor_period_returns: dict[str, float] | None = None
+    period_start: str | None = Field(default=None, description="ISO date for auto-computing factor returns")
+    period_end: str | None = Field(default=None, description="ISO date for auto-computing factor returns")
+
+
+class FactorAlphaRequest(BaseModel):
+    """Compute detailed alpha metrics from a regression result."""
+
+    regression_result: dict[str, Any]
+
+
+class FactorDriftRequest(BaseModel):
+    """Detect style drift from rolling regression snapshots."""
+
+    rolling_snapshots: list[dict[str, Any]] = Field(min_length=10)
+    threshold_pct: float = Field(default=50.0, ge=0)

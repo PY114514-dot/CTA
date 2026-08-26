@@ -1,20 +1,20 @@
 import type { ThemeConfig } from "antd";
 
 /**
- * Serif editorial design tokens (default gold palette).
+ * Research dashboard design tokens (default professional-blue palette).
  *
  * Kept as a static reference of the default palette; runtime theming is
  * driven by AccentPreset values and the --serif-* CSS variables.
  */
 export const SERIF_TOKENS = {
-  background: "#FAFAF8",
-  foreground: "#1A1A1A",
-  muted: "#F5F3F0",
-  mutedForeground: "#6B6B6B",
-  accent: "#B8860B",
-  accentSecondary: "#D4A84B",
-  border: "#E8E4DF",
-  borderHover: "#D8D2C9",
+  background: "#F8FAFC",
+  foreground: "#1E293B",
+  muted: "#EFF4FA",
+  mutedForeground: "#64748B",
+  accent: "#2563EB",
+  accentSecondary: "#3B82F6",
+  border: "#E2E8F0",
+  borderHover: "#CBD5E1",
   card: "#FFFFFF",
 } as const;
 
@@ -54,40 +54,16 @@ export interface AccentPreset {
 
 export const ACCENT_PRESETS: AccentPreset[] = [
   {
-    key: "gold",
-    label: "明金",
-    accent: "#F0B429",
-    deep: "#B8860B",
-    background: "#FAFAF8",
+    key: "blue",
+    label: "专业蓝",
+    accent: "#2563EB",
+    deep: "#1D4ED8",
+    background: "#F8FAFC",
     card: "#FFFFFF",
-    border: "#E8E4DF",
-    muted: "#F5F3F0",
-    mutedForeground: "#6B6B6B",
-    foreground: "#1A1A1A",
-  },
-  {
-    key: "ink",
-    label: "墨黑",
-    accent: "#1A1A1A",
-    deep: "#1A1A1A",
-    background: "#F5F6F7",
-    card: "#FFFFFF",
-    border: "#E0E2E5",
-    muted: "#EDEEF0",
-    mutedForeground: "#62686D",
-    foreground: "#16181A",
-  },
-  {
-    key: "indigo",
-    label: "靛蓝",
-    accent: "#3D5A80",
-    deep: "#2E4460",
-    background: "#F5F7FA",
-    card: "#FFFFFF",
-    border: "#DDE4EC",
-    muted: "#EBF0F6",
-    mutedForeground: "#5C6B7F",
-    foreground: "#1C2733",
+    border: "#E2E8F0",
+    muted: "#EFF4FA",
+    mutedForeground: "#64748B",
+    foreground: "#1E293B",
   },
   {
     key: "pine",
@@ -168,7 +144,7 @@ export function applyAccentCssVariables(preset: AccentPreset): void {
 
 /**
  * Ant Design v5 theme built from one complete accent preset. Bright accents
- * (e.g. the CubeMind-style gold) get near-black button text; dark accents
+ * Bright accents get near-black button text; dark accents
  * get white text.
  */
 export function buildSerifTheme(preset: AccentPreset): ThemeConfig {
@@ -305,5 +281,5 @@ export function buildSerifTheme(preset: AccentPreset): ThemeConfig {
   };
 }
 
-/** Default theme instance (bright CubeMind-style gold). */
+/** Default theme instance (professional blue). */
 export const serifTheme: ThemeConfig = buildSerifTheme(ACCENT_PRESETS[0]!);

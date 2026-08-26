@@ -629,16 +629,31 @@ def _state_analysis(frame: pd.DataFrame, specs: list[ProxySpec], market_frame: p
     symbols = [spec.symbol for spec in specs if spec.symbol in market_frame]
     if not symbols:
         return []
-    market = market_frame[symbols].mean(axis=1)
+    proxies = market_frame[symbols]
+    market = proxies.mean(axis=1)
     y = frame["__product__"]
     lookback = _LOOKBACKS.get(frequency, _LOOKBACKS["weekly"])[1]
     lagged_vol = market.rolling(max(lookback * 3, 6), min_periods=max(lookback, 3)).std().shift(1)
-    threshold = lagged_vol.median()
-    if not isfinite(float(threshold)) or threshold <= 0:
+    volatility_threshold = lagged_vol.median()
+    lagged_dispersion = proxies.std(axis=1).rolling(max(lookback, 2), min_periods=max(lookback, 2)).mean().shift(1)
+    dispersion_threshold = lagged_dispersion.median()
+    if not isfinite(float(volatility_threshold)) or volatility_threshold <= 0:
         return []
     trend = (1.0 + market).rolling(max(lookback, 2), min_periods=max(lookback, 2)).apply(np.prod, raw=True).shift(1) - 1.0
-    states = [("低波动", lagged_vol <= threshold), ("高波动", lagged_vol > threshold), ("趋势向上", trend > 0), ("趋势向下", trend <= 0)]
+    scope = "商品市场" if all(spec.asset_class == "commodity" for spec in specs) else "市场代理"
+    states = [
+        (f"{scope}低波动", lagged_vol <= volatility_threshold),
+        (f"{scope}高波动", lagged_vol > volatility_threshold),
+        (f"{scope}趋势向上", trend > 0),
+        (f"{scope}趋势向下", trend <= 0),
+    ]
+    if isfinite(float(dispersion_threshold)) and dispersion_threshold > 0:
+        states.extend([
+            (f"{scope}低分化", lagged_dispersion <= dispersion_threshold),
+            (f"{scope}高分化", lagged_dispersion > dispersion_threshold),
+        ])
     output = []
+    unconditional_mean = float(y.mean())
     for name, mask in states:
         valid = mask & y.notna()
         count = int(valid.sum())
@@ -650,9 +665,10 @@ def _state_analysis(frame: pd.DataFrame, specs: list[ProxySpec], market_frame: p
             "state": name,
             "periods": count,
             "product_mean_return": round(float(product_values.mean()), 6),
+            "relative_mean_return": round(float(product_values.mean()) - unconditional_mean, 6),
             "product_positive_rate": round(float(np.mean(product_values > 0)), 4),
             "market_mean_return": round(float(market_values.mean()), 6),
-            "interpretation": "条件样本表现，用于发现状态依赖，不是预测。",
+            "interpretation": "状态只使用本期前可得的趋势、波动和横截面分化构造；用于历史条件表现，不是预测。",
         })
     return output
 
@@ -662,9 +678,11 @@ def _diagnostics(model: dict[str, Any], bootstrap: dict[str, dict[str, float]], 
     nonlinear = model.get("nonlinear_oos_r2")
     linear = model.get("linear_oos_r2")
     uplift = model.get("nonlinear_uplift")
-    reliability = "高" if observations >= 80 and consistency >= 0.7 else "中" if observations >= 40 and consistency >= 0.55 else "低"
+    stability = "高" if observations >= 80 and consistency >= 0.7 else "中" if observations >= 40 and consistency >= 0.55 else "低"
+    best_oos_r2 = max(value for value in (linear, nonlinear) if value is not None) if linear is not None or nonlinear is not None else None
+    reliability = "高" if stability == "高" and best_oos_r2 is not None and best_oos_r2 >= 0.05 else "中" if stability != "低" and best_oos_r2 is not None and best_oos_r2 > 0 else "低"
     if observations < _MIN_OBS or not factors:
-        reliability = "不可识别"
+        stability = reliability = "不可识别"
     return {
         "observation_count": int(observations),
         "proxy_count": int(proxy_count),
@@ -675,6 +693,7 @@ def _diagnostics(model: dict[str, Any], bootstrap: dict[str, dict[str, float]], 
         "nonlinear_oos_r2": nonlinear,
         "nonlinear_uplift": uplift,
         "mean_bootstrap_sign_consistency": round(consistency, 4),
+        "statistical_stability_label": stability,
         "reliability_label": reliability,
         "feature_list": factors,
         "carry_data_available": False,
@@ -692,6 +711,9 @@ def _diagnostic_warnings(diagnostics: dict[str, Any], strategies: list[dict[str,
         warnings.append("非线性模型没有改善样本外解释度，不能据此宣称存在稳定的复杂交互。")
     if float(diagnostics.get("mean_bootstrap_sign_consistency", 0.0)) < 0.55:
         warnings.append("Bootstrap 符号一致性偏低，候选暴露可能随窗口变化。")
+    r2_values = [value for value in (diagnostics.get("linear_oos_r2"), diagnostics.get("nonlinear_oos_r2")) if value is not None]
+    if r2_values and max(r2_values) <= 0:
+        warnings.append("线性和非线性模型的样本外解释度均未为正，板块与行为候选仅供排查，不应形成归因结论。")
     weak = [row["label"] for row in strategies if row.get("status") == "weak_or_unstable"]
     if weak:
         warnings.append(f"弱或不稳定的策略指纹：{'、'.join(weak[:4])}。")

@@ -1,5 +1,7 @@
 """HTTP seam for the read-only CODEX CTA ranking engine and snapshots."""
 
+from datetime import date
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -63,28 +65,41 @@ def list_cta_ranking_snapshots(
     limit: int = 12,
     session: Session = Depends(get_session),
 ) -> list[CtaRankingSnapshotSummary]:
-    """List immutable ranking snapshots, newest first."""
+    """List immutable ranking snapshots, newest first.
+
+    只读取摘要所需的标量字段，不做 CtaRankingResponse 全量校验——
+    每个快照含 700+ 只产品的完整排名，全量解析会让列表接口随快照数线性变慢。
+    """
     limit = max(1, min(limit, 52))
     snapshots = session.execute(
         select(DataSnapshot)
         .where(DataSnapshot.label.like("codex-cta:%"))
         .order_by(DataSnapshot.created_at.desc())
-        .limit(limit)
+        .limit(52)
     ).scalars().all()
     result: list[CtaRankingSnapshotSummary] = []
     for snapshot in snapshots:
         content = snapshot.content or {}
+        try:
+            as_of_date = date.fromisoformat(str(content.get("as_of_date", "")))
+        except ValueError:
+            continue
+        model_version = str(content.get("model_version", ""))
+        if not model_version:
+            continue
         result.append(CtaRankingSnapshotSummary(
             snapshot_id=snapshot.id,
             label=snapshot.label,
-            model_version=str(content.get("model_version", "")),
-            as_of_date=content.get("as_of_date"),
+            model_version=model_version,
+            as_of_date=as_of_date,
             created_at=snapshot.created_at.isoformat() if snapshot.created_at else None,
             nav_fingerprint=str(content.get("nav_fingerprint", "")),
             attribution_evidence_fingerprint=str(content.get("attribution_evidence_fingerprint", "")),
             universe_size=int(content.get("universe_size", 0)),
             eligible_count=int(content.get("eligible_count", 0)),
         ))
+        if len(result) == limit:
+            break
     return result
 
 
@@ -106,3 +121,16 @@ def get_cta_ranking_snapshot(
         created_at=snapshot.created_at.isoformat() if snapshot.created_at else None,
         ranking=ranking,
     )
+
+
+@router.delete("/snapshots/{snapshot_id}", status_code=204)
+def delete_cta_ranking_snapshot(
+    snapshot_id: str,
+    session: Session = Depends(get_session),
+) -> None:
+    """Delete one persisted ranking snapshot chosen from history."""
+    snapshot = session.get(DataSnapshot, snapshot_id)
+    if snapshot is None or not (snapshot.label or "").startswith("codex-cta:"):
+        raise HTTPException(status_code=404, detail="CODEX 排名快照不存在")
+    session.delete(snapshot)
+    session.commit()

@@ -15,7 +15,8 @@ import hashlib
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import case, delete, exists, func, or_, select
+from sqlalchemy.engine import Row
 from sqlalchemy.orm import Session, selectinload
 
 from app.models import (
@@ -94,12 +95,40 @@ def list_files(
     session: Session,
     *,
     parsing_status: str | None = None,
+    pending_only: bool = False,
     limit: int = 100,
     offset: int = 0,
 ) -> list[RawFile]:
-    stmt = select(RawFile).order_by(RawFile.uploaded_at.desc())
+    stmt = select(RawFile).options(
+        selectinload(RawFile.fragments).selectinload(DocumentFragment.product),
+        selectinload(RawFile.nav_observations).selectinload(NavObservation.product),
+    ).order_by(RawFile.uploaded_at.desc())
     if parsing_status:
         stmt = stmt.where(RawFile.parsing_status == parsing_status)
+    if pending_only:
+        unresolved_fragment = exists(
+            select(DocumentFragment.id).where(
+                DocumentFragment.file_id == RawFile.id,
+                or_(
+                    DocumentFragment.product_id.is_(None),
+                    DocumentFragment.content_data["binding_status"].as_string() == "unmatched",
+                ),
+            )
+        )
+        unreviewed_nav = exists(
+            select(NavObservation.id).where(
+                NavObservation.source_file_id == RawFile.id,
+                NavObservation.review_status != ReviewStatus.REVIEWED,
+            )
+        )
+        stmt = stmt.where(
+            or_(RawFile.source.is_(None), RawFile.source != "futures_weekly_sqlite"),
+            or_(
+                RawFile.parsing_status.in_(("pending", "processing", "failed", "completed_no_nav")),
+                unresolved_fragment,
+                unreviewed_nav,
+            ),
+        )
     return list(session.execute(stmt.offset(offset).limit(limit)).scalars().all())
 
 
@@ -230,7 +259,14 @@ def list_products(
     limit: int = 50,
     offset: int = 0,
 ) -> list[ProductEntity]:
-    stmt = select(ProductEntity).order_by(ProductEntity.created_at.desc())
+    stmt = (
+        select(ProductEntity)
+        .options(
+            selectinload(ProductEntity.fragments).selectinload(DocumentFragment.file),
+            selectinload(ProductEntity.facts),
+        )
+        .order_by(ProductEntity.created_at.desc())
+    )
     if confirmation_status:
         stmt = stmt.where(ProductEntity.confirmation_status == confirmation_status)
     if strategy:
@@ -355,7 +391,7 @@ def update_product(
         return None
     editable = {
         "standard_name", "manager_name", "strategy", "inception_date",
-        "close_date", "nav_frequency", "status", "notes",
+        "close_date", "nav_frequency", "status", "notes", "strategy_disclosure",
     }
     for key, value in fields.items():
         if key in editable:
@@ -378,6 +414,7 @@ def delete_product(session: Session, product_id: str) -> bool:
         return False
 
     session.execute(delete(NavObservation).where(NavObservation.product_id == product_id))
+    session.execute(delete(NavCandidateVersion).where(NavCandidateVersion.product_id == product_id))
     session.execute(delete(StructuredFact).where(StructuredFact.product_id == product_id))
     session.execute(delete(ProductAlias).where(ProductAlias.product_id == product_id))
 
@@ -798,6 +835,102 @@ def get_nav_series(
     if reviewed_only:
         stmt = stmt.where(NavObservation.review_status == ReviewStatus.REVIEWED)
     return list(session.execute(stmt).scalars().all())
+
+
+def get_nav_series_bulk(
+    session: Session, product_ids: list[str], *, reviewed_only: bool = False
+) -> dict[str, list[Row]]:
+    """单次查询批量读取多只产品的净值序列，按 product_id 分组返回。
+
+    与逐只调用 get_nav_series 返回相同的字段（Row 支持属性访问），但走
+    Core 列查询、不构造 ORM 对象：排名/评分宇宙构建一次要取 700+ 只
+    产品、18 万+ 净值点，ORM 物化是主要耗时（约 5s），列查询可压到 1s 内。
+    """
+    grouped: dict[str, list[Row]] = {product_id: [] for product_id in product_ids}
+    if not product_ids:
+        return grouped
+    stmt = (
+        select(
+            NavObservation.id,
+            NavObservation.product_id,
+            NavObservation.observation_date,
+            NavObservation.nav,
+            NavObservation.acc_nav,
+            NavObservation.frequency,
+            NavObservation.source_file_id,
+            NavObservation.review_status,
+        )
+        .where(NavObservation.product_id.in_(product_ids))
+        .order_by(NavObservation.product_id, NavObservation.observation_date)
+    )
+    if reviewed_only:
+        stmt = stmt.where(NavObservation.review_status == ReviewStatus.REVIEWED)
+    for row in session.execute(stmt):
+        grouped.setdefault(row.product_id, []).append(row)
+    return grouped
+
+
+def get_nav_stats_bulk(session: Session, product_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """单查询聚合多只产品的净值统计，供产品列表载荷使用。
+
+    列表页每只产品都要展示点数、复核数、起止日期与来源状态；逐只物化
+    全部净值点（18 万+ 行 ORM 对象）是主要耗时。这里全部交给 SQL 聚合。
+    """
+    if not product_ids:
+        return {}
+    stmt = (
+        select(
+            NavObservation.product_id,
+            func.count().label("nav_count"),
+            func.sum(case((NavObservation.review_status == ReviewStatus.REVIEWED, 1), else_=0)).label("reviewed_count"),
+            func.min(NavObservation.observation_date).label("nav_start"),
+            func.max(NavObservation.observation_date).label("nav_end"),
+            # 任一净值点缺来源文件则为 0，全部有来源为 1
+            func.min(case((NavObservation.source_file_id.is_(None), 0), else_=1)).label("all_have_source"),
+            # 任一净值点不是 futures_weekly_sqlite 直连来源则为 0，全部是则为 1
+            func.min(case((RawFile.source == "futures_weekly_sqlite", 1), else_=0)).label("all_direct"),
+        )
+        .select_from(NavObservation)
+        .outerjoin(RawFile, NavObservation.source_file_id == RawFile.id)
+        .where(NavObservation.product_id.in_(product_ids))
+        .group_by(NavObservation.product_id)
+    )
+    result: dict[str, dict[str, Any]] = {}
+    for row in session.execute(stmt):
+        result[row.product_id] = {
+            "nav_count": int(row.nav_count or 0),
+            "reviewed_count": int(row.reviewed_count or 0),
+            "nav_start": row.nav_start,
+            "nav_end": row.nav_end,
+            "all_have_source": int(row.all_have_source or 1),
+            "all_direct": int(row.all_direct or 0),
+        }
+    return result
+
+
+def get_nav_source_info_bulk(
+    session: Session, product_ids: list[str]
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """返回每只产品净值点的去重来源文件名与来源文件 ID。
+
+    按 (product_id, file_id) 分组，只返回每只产品几个去重文件，而不是
+    逐行遍历全部净值点。
+    """
+    names: dict[str, list[str]] = {}
+    file_ids: dict[str, list[str]] = {}
+    if not product_ids:
+        return names, file_ids
+    stmt = (
+        select(NavObservation.product_id, RawFile.id, RawFile.filename)
+        .join(RawFile, NavObservation.source_file_id == RawFile.id)
+        .where(NavObservation.product_id.in_(product_ids))
+        .group_by(NavObservation.product_id, RawFile.id, RawFile.filename)
+        .order_by(NavObservation.product_id, RawFile.id)
+    )
+    for product_id, file_id, filename in session.execute(stmt):
+        names.setdefault(product_id, []).append(filename)
+        file_ids.setdefault(product_id, []).append(file_id)
+    return names, file_ids
 
 
 def review_nav_observations(

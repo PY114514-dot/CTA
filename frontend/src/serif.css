@@ -5,13 +5,13 @@
    ========================================================================== */
 
 :root {
-  --serif-background: #fafaf8;
-  --serif-foreground: #1a1a1a;
-  --serif-muted: #f5f3f0;
-  --serif-muted-foreground: #6b6b6b;
-  --serif-accent: #b8860b;
-  --serif-accent-secondary: #d4a84b;
-  --serif-border: #e8e4df;
+  --serif-background: #f8fafc;
+  --serif-foreground: #1e293b;
+  --serif-muted: #eff4fa;
+  --serif-muted-foreground: #64748b;
+  --serif-accent: #1d4ed8;
+  --serif-accent-secondary: #3b82f6;
+  --serif-border: #e2e8f0;
   --serif-card: #ffffff;
   --font-display: "Source Sans 3", "PingFang SC", "Microsoft YaHei", "Helvetica Neue", system-ui, sans-serif;
   --font-body: "Source Sans 3", "PingFang SC", "Microsoft YaHei", "Helvetica Neue", system-ui, sans-serif;
@@ -141,7 +141,7 @@ h1, h2, h3, h4, h5,
 }
 
 /* --------------------------------------------------------------------------
-   Card accent top border — a thin gold rule crowning featured cards.
+   Card accent top border — a thin blue rule crowning featured cards.
    -------------------------------------------------------------------------- */
 .card-accent-top {
   border-top: 2px solid var(--serif-accent) !important;

@@ -1,6 +1,7 @@
 import { Button, Col, Input, InputNumber, Row, Select, Typography } from "antd";
 import { AnchorMarkButton, ANCHOR_LINE_COLORS, StepSection } from "../StepSection";
 import type { AnchorKind } from "../../hooks/useImageDigitization";
+import type { ImageExtractionFrequency } from "../../api";
 
 const { Paragraph } = Typography;
 
@@ -9,6 +10,8 @@ export default function AdvancedCalibrationPanel({
   visible,
   valueMode,
   onValueModeChange,
+  imageExtractionFrequency,
+  onImageExtractionFrequencyChange,
   activeAnchor,
   onActiveAnchorChange,
   canMark,
@@ -30,6 +33,8 @@ export default function AdvancedCalibrationPanel({
   visible: boolean;
   valueMode: "nav" | "cumulative_return";
   onValueModeChange: (value: "nav" | "cumulative_return") => void;
+  imageExtractionFrequency: ImageExtractionFrequency;
+  onImageExtractionFrequencyChange: (value: ImageExtractionFrequency) => void;
   activeAnchor?: AnchorKind;
   onActiveAnchorChange: (anchor: AnchorKind) => void;
   canMark: boolean;
@@ -51,9 +56,18 @@ export default function AdvancedCalibrationPanel({
   const inputStyle = (anchor: AnchorKind) => activeAnchor === anchor ? { borderColor: ANCHOR_LINE_COLORS[anchor] } : undefined;
   return (
     <StepSection step={2} title="高级校准（仅曲线不贴合时使用）" visible={visible}>
-      <Select value={valueMode} onChange={onValueModeChange} placeholder="请选择纵轴口径" style={{ width: "100%", maxWidth: 280 }} options={[
-        { value: "nav", label: "纵轴：单位净值" }, { value: "cumulative_return", label: "纵轴：累计收益率 (%)" },
-      ]} />
+      <Row gutter={[12, 12]}>
+        <Col xs={24} sm={12}>
+          <Select value={valueMode} onChange={onValueModeChange} placeholder="请选择纵轴口径" style={{ width: "100%" }} options={[
+            { value: "nav", label: "纵轴：单位净值" }, { value: "cumulative_return", label: "纵轴：累计收益率 (%)" },
+          ]} />
+        </Col>
+        <Col xs={24} sm={12}>
+          <Select<ImageExtractionFrequency> aria-label="图片提取频率" value={imageExtractionFrequency} onChange={onImageExtractionFrequencyChange} style={{ width: "100%" }} options={[
+            { value: "weekly", label: "净值频率：周频" }, { value: "monthly", label: "净值频率：月频" }, { value: "daily", label: "净值频率：日频（仅明确日频披露）" }, { value: "auto", label: "净值频率：自动判断" },
+          ]} />
+        </Col>
+      </Row>
       <Paragraph type="secondary" style={{ marginTop: 10, marginBottom: 12, fontSize: 13 }}>
         调整曲线前，请先标记纵轴最大值和最小值；随后可直接拖动橙色点使候选线贴合原图。日期和四个锚点仅在自动结果不可靠时才需要校准。
       </Paragraph>
@@ -82,10 +96,10 @@ export default function AdvancedCalibrationPanel({
       </Row>
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 16 }}>
         <Button type="primary" loading={isDigitizing} disabled={!canStartRecognition} onClick={onStartRecognition}>
-          按当前校准识别产品净值
+          {valueMode === "cumulative_return" ? "按当前校准换算标准净值" : "按当前校准识别产品净值"}
         </Button>
         <span style={{ fontSize: 12, color: "var(--serif-muted-foreground)" }}>
-          填完首末日期、最大值和最小值后，按此按钮执行手动校准识别。
+          {valueMode === "cumulative_return" ? "收益率按 净值 = 1 + 累计收益率 换算；填完首末日期和纵轴范围后执行。" : "填完首末日期、最大值和最小值后，按此按钮执行手动校准识别。"}
         </span>
       </div>
       <div style={{ marginTop: 10, fontSize: 12, color: "var(--serif-muted-foreground)" }}>

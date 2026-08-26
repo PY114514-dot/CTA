@@ -485,3 +485,450 @@ def evaluate_nonlinear_increment(
         "sensitivity": sensitivity,
         "warnings": warnings,
     }
+
+
+def _empty_metric(observations: int) -> dict[str, float | int | None]:
+    return {
+        "observations": observations,
+        "oos_r2": None,
+        "correlation": None,
+        "rmse": None,
+        "mean_residual": None,
+    }
+
+
+def _evaluate_registered_interaction_segments(
+    y: np.ndarray,
+    x: np.ndarray,
+    dates: list[date],
+    *,
+    train_window: int,
+    test_window: int,
+    max_segments: int,
+) -> dict[str, Any]:
+    """Evaluate the fixed main-effect and one-interaction nested models."""
+    available_segments = max(0, (len(y) - train_window) // test_window)
+    segment_count = min(max_segments, available_segments)
+    segments: list[dict[str, Any]] = []
+    failures: list[str] = []
+    for segment_index in range(segment_count):
+        train_end = train_window + segment_index * test_window
+        test_end = train_end + test_window
+        train_y = y[:train_end]
+        test_y = y[train_end:test_end]
+        train_x = x[:train_end]
+        test_x = x[train_end:test_end]
+        means = np.mean(train_x, axis=0)
+        scales = np.std(train_x, axis=0, ddof=0)
+        segment_base = {
+            "segment": segment_index + 1,
+            "train_start_date": _iso(dates[0]),
+            "train_end_date": _iso(dates[train_end - 1]),
+            "test_start_date": _iso(dates[train_end]),
+            "test_end_date": _iso(dates[test_end - 1]),
+            "train_observations": train_end,
+            "test_observations": len(test_y),
+        }
+        if not np.isfinite(scales).all() or np.any(scales <= 1e-12):
+            message = f"第 {segment_index + 1} 个测试段标准化尺度无效"
+            failures.append(message)
+            segments.append({
+                **segment_base,
+                "linear": _empty_metric(len(test_y)),
+                "nonlinear": _empty_metric(len(test_y)),
+                "r2_delta": None,
+                "correlation_delta": None,
+                "rmse_delta": None,
+                "interaction_coefficient": None,
+                "predictions_available": False,
+            })
+            continue
+        train_z = (train_x - means) / scales
+        test_z = (test_x - means) / scales
+        interaction_train = np.column_stack([train_z, train_z[:, 0] * train_z[:, 1]])
+        interaction_test = np.column_stack([test_z, test_z[:, 0] * test_z[:, 1]])
+        benchmark = float(np.sum(np.square(test_y - np.mean(train_y))))
+        try:
+            linear_prediction = _fit_linear_predict(train_z, train_y, test_z)
+            interaction_prediction = _fit_linear_predict(train_y=train_y, train_x=interaction_train, test_x=interaction_test)
+            coefficients, _, _, _ = np.linalg.lstsq(
+                np.column_stack([np.ones(len(train_z)), interaction_train]),
+                train_y,
+                rcond=None,
+            )
+            linear = _metric_summary(test_y, linear_prediction, benchmark)
+            interaction = _metric_summary(test_y, interaction_prediction, benchmark)
+            r2_delta = (
+                float(interaction["oos_r2"] - linear["oos_r2"])
+                if interaction["oos_r2"] is not None and linear["oos_r2"] is not None
+                else None
+            )
+            correlation_delta = (
+                float(interaction["correlation"] - linear["correlation"])
+                if interaction["correlation"] is not None and linear["correlation"] is not None
+                else None
+            )
+            rmse_delta = (
+                float(interaction["rmse"] - linear["rmse"])
+                if interaction["rmse"] is not None and linear["rmse"] is not None
+                else None
+            )
+            segments.append({
+                **segment_base,
+                "linear": linear,
+                "nonlinear": interaction,
+                "r2_delta": _round(r2_delta, 6),
+                "correlation_delta": _round(correlation_delta, 6),
+                "rmse_delta": _round(rmse_delta, 8),
+                "interaction_coefficient": _round(float(coefficients[-1]), 8),
+                "predictions_available": bool(np.isfinite(linear_prediction).all() and np.isfinite(interaction_prediction).all()),
+            })
+        except (np.linalg.LinAlgError, ValueError) as error:
+            failures.append(f"第 {segment_index + 1} 个嵌套模型失败：{error}")
+            segments.append({
+                **segment_base,
+                "linear": _empty_metric(len(test_y)),
+                "nonlinear": _empty_metric(len(test_y)),
+                "r2_delta": None,
+                "correlation_delta": None,
+                "rmse_delta": None,
+                "interaction_coefficient": None,
+                "predictions_available": False,
+            })
+    return {"segments": segments, "failures": failures, "available_segments": available_segments}
+
+
+def _registered_interaction_summary(
+    segments: list[dict[str, Any]],
+    *,
+    min_segments: int,
+    min_r2_uplift: float,
+    min_positive_fraction: float,
+) -> dict[str, Any]:
+    base = _summarize_deltas(
+        segments,
+        min_segments=min_segments,
+        min_r2_uplift=min_r2_uplift,
+        min_positive_fraction=min_positive_fraction,
+    )
+    coefficients = np.asarray(
+        [item["interaction_coefficient"] for item in segments if item["interaction_coefficient"] is not None],
+        dtype=float,
+    )
+    coefficient_sign_consistency: float | None = None
+    if coefficients.size:
+        reference = float(np.median(coefficients))
+        if abs(reference) > 1e-12:
+            coefficient_sign_consistency = float(np.mean(np.sign(coefficients) == np.sign(reference)))
+    stable = bool(
+        base["stable_improvement"]
+        and coefficient_sign_consistency is not None
+        and coefficient_sign_consistency >= min_positive_fraction
+    )
+    base.update({
+        "stable_improvement": stable,
+        "interaction_coefficient_mean": _round(float(np.mean(coefficients)), 8) if coefficients.size else None,
+        "interaction_coefficient_median": _round(float(np.median(coefficients)), 8) if coefficients.size else None,
+        "interaction_coefficient_sign_consistency": _round(coefficient_sign_consistency, 6),
+        "conclusion": "存在动量 × 波动率的稳定样本外增量" if stable else "未发现可靠的动量 × 波动率样本外增量",
+        "rejection_reason": None if stable else "未发现可靠的动量 × 波动率样本外增量",
+    })
+    return base
+
+
+def _registered_interaction_scenario(
+    y: np.ndarray,
+    x: np.ndarray,
+    dates: list[date],
+    *,
+    train_window: int,
+    test_window: int,
+    max_segments: int,
+    min_segments: int,
+    min_r2_uplift: float,
+    min_positive_fraction: float,
+) -> dict[str, Any]:
+    evaluation = _evaluate_registered_interaction_segments(
+        y,
+        x,
+        dates,
+        train_window=train_window,
+        test_window=test_window,
+        max_segments=max_segments,
+    )
+    summary = _registered_interaction_summary(
+        evaluation["segments"],
+        min_segments=min_segments,
+        min_r2_uplift=min_r2_uplift,
+        min_positive_fraction=min_positive_fraction,
+    )
+    return {
+        "train_window": train_window,
+        "test_window": test_window,
+        "segment_count": len(evaluation["segments"]),
+        "status": "available" if len(evaluation["segments"]) >= min_segments else "insufficient",
+        "mean_r2_delta": summary["mean_r2_delta"],
+        "median_r2_delta": summary["median_r2_delta"],
+        "positive_delta_fraction": summary["positive_delta_fraction"],
+        "stable_improvement": summary["stable_improvement"],
+        "conclusion": summary["conclusion"],
+    }
+
+
+def _build_registered_interaction_sensitivity(
+    y: np.ndarray,
+    x: np.ndarray,
+    dates: list[date],
+    *,
+    train_window: int,
+    test_window: int,
+    max_segments: int,
+    min_segments: int,
+    min_r2_uplift: float,
+    min_positive_fraction: float,
+) -> dict[str, Any]:
+    train_candidates = sorted({
+        train_window,
+        max(_MIN_TRAIN_OBSERVATIONS, int(round(train_window * 0.75))),
+        max(_MIN_TRAIN_OBSERVATIONS, int(round(train_window * 1.25))),
+    })
+    test_candidates = sorted({
+        test_window,
+        max(_MIN_TEST_OBSERVATIONS, int(round(test_window * 0.75))),
+        max(_MIN_TEST_OBSERVATIONS, int(round(test_window * 1.25))),
+    })
+    window_sensitivity = [
+        _registered_interaction_scenario(
+            y,
+            x,
+            dates,
+            train_window=candidate,
+            test_window=test_window,
+            max_segments=max_segments,
+            min_segments=min_segments,
+            min_r2_uplift=min_r2_uplift,
+            min_positive_fraction=min_positive_fraction,
+        )
+        for candidate in train_candidates
+    ]
+    window_sensitivity.extend(
+        _registered_interaction_scenario(
+            y,
+            x,
+            dates,
+            train_window=train_window,
+            test_window=candidate,
+            max_segments=max_segments,
+            min_segments=min_segments,
+            min_r2_uplift=min_r2_uplift,
+            min_positive_fraction=min_positive_fraction,
+        )
+        for candidate in test_candidates
+        if candidate != test_window
+    )
+    base_evaluation = _evaluate_registered_interaction_segments(
+        y,
+        x,
+        dates,
+        train_window=train_window,
+        test_window=test_window,
+        max_segments=max_segments,
+    )
+    threshold_sensitivity = []
+    for threshold in sorted({0.0, min_r2_uplift, max(0.01, min_r2_uplift * 2.0)}):
+        summary = _registered_interaction_summary(
+            base_evaluation["segments"],
+            min_segments=min_segments,
+            min_r2_uplift=threshold,
+            min_positive_fraction=min_positive_fraction,
+        )
+        threshold_sensitivity.append({
+            "minimum_r2_uplift": threshold,
+            "stable_improvement": summary["stable_improvement"],
+            "positive_delta_fraction": summary["positive_delta_fraction"],
+            "mean_r2_delta": summary["mean_r2_delta"],
+        })
+    model_parameter_sensitivity = [
+        {"label": "标准化：训练窗口拟合", **_registered_interaction_scenario(
+            y,
+            x,
+            dates,
+            train_window=train_window,
+            test_window=test_window,
+            max_segments=max_segments,
+            min_segments=min_segments,
+            min_r2_uplift=min_r2_uplift,
+            min_positive_fraction=fraction,
+        )}
+        for fraction in sorted({min_positive_fraction, 0.6, 0.9})
+    ]
+    stable_windows = all(item["status"] == "available" and item["stable_improvement"] for item in window_sensitivity)
+    stable_parameters = all(item["status"] == "available" and item["stable_improvement"] for item in model_parameter_sensitivity)
+    deltas = [item["r2_delta"] for item in base_evaluation["segments"] if item["r2_delta"] is not None]
+    raw_p = _one_sided_sign_test_p_value(deltas, min_r2_uplift)
+    candidate_count = len(window_sensitivity) + len(threshold_sensitivity) + len(model_parameter_sensitivity)
+    return {
+        "window_sensitivity": window_sensitivity,
+        "threshold_sensitivity": threshold_sensitivity,
+        "model_parameter_sensitivity": model_parameter_sensitivity,
+        "stable_across_pre_registered_scenarios": stable_windows and stable_parameters,
+        "selection_policy": {
+            "base_case_is_pre_registered": True,
+            "selected_from_sensitivity": False,
+            "sensitivity_is_diagnostic_only": True,
+        },
+        "multiple_testing": {
+            "candidate_scenarios_count": candidate_count,
+            "correction": "bonferroni_descriptive",
+            "raw_one_sided_sign_test_p_value": _round(raw_p, 6),
+            "bonferroni_adjusted_p_value": _round(min(1.0, raw_p * max(1, candidate_count)) if raw_p is not None else None, 6),
+            "dsr_applicable": False,
+            "dsr_note": "DSR 适用于风险调整收益/Sharpe 的多重选择；本层只比较预登记预测误差增量。",
+        },
+    }
+
+
+def evaluate_momentum_volatility_increment(
+    returns: np.ndarray,
+    factor_returns: np.ndarray,
+    dates: list[date],
+    *,
+    frequency: str,
+    train_window: int,
+    test_window: int,
+    max_segments: int = 5,
+    min_segments: int = 3,
+    min_r2_uplift: float = 0.01,
+    min_positive_fraction: float = _DEFAULT_MIN_POSITIVE_FRACTION,
+) -> dict[str, Any]:
+    """Run the pre-registered nested OOS test for momentum × volatility.
+
+    The main-effects model and the interaction model use the same expanding
+    training windows.  Standardization parameters are fit inside each
+    training window and then applied unchanged to its following test segment.
+    """
+    y, x = _validate_inputs(
+        returns,
+        factor_returns,
+        dates,
+        ["momentum", "volatility"],
+        train_window,
+        test_window,
+        max_segments,
+        min_segments,
+    )
+    if x.shape[1] != 2:
+        raise ValueError("动量 × 波动率检验必须提供两列因子：momentum、volatility")
+    if not 0.0 <= min_positive_fraction <= 1.0:
+        raise ValueError("min_positive_fraction 必须在 0 和 1 之间")
+    if min_r2_uplift < 0:
+        raise ValueError("min_r2_uplift 不能为负数")
+    evaluation = _evaluate_registered_interaction_segments(
+        y,
+        x,
+        dates,
+        train_window=train_window,
+        test_window=test_window,
+        max_segments=max_segments,
+    )
+    summary = _registered_interaction_summary(
+        evaluation["segments"],
+        min_segments=min_segments,
+        min_r2_uplift=min_r2_uplift,
+        min_positive_fraction=min_positive_fraction,
+    )
+    status = "available" if len(evaluation["segments"]) >= min_segments else "insufficient"
+    warnings = [
+        "交互项只用于检验主效应之外的样本外增量，不进入产品质量分。",
+        "该结果是收益预测证据，不是持仓、真实 P&L 或管理人技能归因。",
+    ]
+    if status == "insufficient":
+        warnings.append(f"样本不足：需要至少 {min_segments} 个连续测试段。")
+    warnings.extend(evaluation["failures"])
+    sensitivity = _build_registered_interaction_sensitivity(
+        y,
+        x,
+        dates,
+        train_window=train_window,
+        test_window=test_window,
+        max_segments=max_segments,
+        min_segments=min_segments,
+        min_r2_uplift=min_r2_uplift,
+        min_positive_fraction=min_positive_fraction,
+    ) if status == "available" else {
+        "window_sensitivity": [],
+        "threshold_sensitivity": [],
+        "model_parameter_sensitivity": [],
+        "stable_across_pre_registered_scenarios": False,
+        "selection_policy": {"base_case_is_pre_registered": True, "selected_from_sensitivity": False, "sensitivity_is_diagnostic_only": True},
+        "multiple_testing": {"candidate_scenarios_count": 0, "correction": "bonferroni_descriptive", "raw_one_sided_sign_test_p_value": None, "bonferroni_adjusted_p_value": None, "dsr_applicable": False, "dsr_note": "样本不足，未进行多重场景比较。"},
+    }
+    return {
+        "method": "pre_registered_oos_momentum_x_volatility_nested_ols",
+        "frequency": frequency,
+        "factor_names": ["momentum", "volatility", "momentum_x_volatility"],
+        "status": status,
+        "parameters": {
+            "train_window": train_window,
+            "test_window": test_window,
+            "max_segments": max_segments,
+            "min_segments": min_segments,
+            "min_r2_uplift": min_r2_uplift,
+            "min_positive_fraction": min_positive_fraction,
+            "training_scheme": "expanding_window",
+            "test_scheme": "contiguous_non_overlapping_segments",
+            "uses_future_data": False,
+            "standardization": "train_window_only",
+            "baseline_model": "OLS_with_intercept_momentum_volatility",
+            "augmented_model": "OLS_with_intercept_momentum_volatility_momentum_x_volatility",
+            "interaction_name": "momentum_x_volatility",
+        },
+        "segments": evaluation["segments"],
+        "summary": summary,
+        "sensitivity": sensitivity,
+        "warnings": warnings,
+    }
+
+
+def evaluate_factor_interaction_increment(
+    returns: np.ndarray,
+    factor_returns: np.ndarray,
+    dates: list[date],
+    *,
+    factor_names: tuple[str, str],
+    interaction_name: str,
+    display_name: str,
+    frequency: str,
+    train_window: int,
+    test_window: int,
+    max_segments: int = 5,
+    min_segments: int = 3,
+    min_r2_uplift: float = 0.01,
+    min_positive_fraction: float = _DEFAULT_MIN_POSITIVE_FRACTION,
+) -> dict[str, Any]:
+    """Evaluate one fixed two-factor interaction with the registered OOS protocol."""
+    if len(factor_names) != 2:
+        raise ValueError("交互检验必须提供两个因子")
+    result = evaluate_momentum_volatility_increment(
+        returns,
+        factor_returns,
+        dates,
+        frequency=frequency,
+        train_window=train_window,
+        test_window=test_window,
+        max_segments=max_segments,
+        min_segments=min_segments,
+        min_r2_uplift=min_r2_uplift,
+        min_positive_fraction=min_positive_fraction,
+    )
+    result["method"] = f"pre_registered_oos_{interaction_name}_nested_ols"
+    result["factor_names"] = [*factor_names, interaction_name]
+    result["parameters"].update({
+        "baseline_model": f"OLS_with_intercept_{factor_names[0]}_{factor_names[1]}",
+        "augmented_model": f"OLS_with_intercept_{factor_names[0]}_{factor_names[1]}_{interaction_name}",
+        "interaction_name": interaction_name,
+    })
+    stable = result["summary"]["stable_improvement"]
+    conclusion = f"发现{display_name}的稳定样本外证据" if stable else f"未发现可靠的{display_name}样本外证据"
+    result["summary"].update({"conclusion": conclusion, "rejection_reason": None if stable else conclusion})
+    return result

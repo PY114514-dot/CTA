@@ -214,6 +214,47 @@ class AKShareProvider(MarketDataProvider):
 
         return pd.DataFrame(columns=_OHLCV_COLUMNS)
 
+    def get_shfe_contracts(self, on_date: date) -> pd.DataFrame:
+        """Return SHFE contracts with their exchange-published expiry date."""
+        ak = self._ensure_akshare()
+        if ak is None:
+            return pd.DataFrame(columns=["contract", "symbol", "expiry"])
+        try:
+            raw = ak.futures_contract_info_shfe(date=on_date.strftime("%Y%m%d"))
+        except Exception as exc:
+            logger.debug("SHFE contract list fetch failed for %s: %s", on_date, exc)
+            return pd.DataFrame(columns=["contract", "symbol", "expiry"])
+        if raw is None or raw.empty or not {"合约代码", "到期日"}.issubset(raw.columns):
+            return pd.DataFrame(columns=["contract", "symbol", "expiry"])
+        result = pd.DataFrame({
+            "contract": raw["合约代码"].astype(str).str.lower(),
+            "expiry": pd.to_datetime(raw["到期日"], errors="coerce").dt.date,
+        }).dropna(subset=["expiry"])
+        result["symbol"] = result["contract"].str.extract(r"^([a-zA-Z]+)", expand=False).str.lower()
+        return result.dropna(subset=["symbol"]).sort_values(["symbol", "expiry"]).reset_index(drop=True)
+
+    def get_shfe_daily_prices(self, on_date: date) -> pd.DataFrame:
+        """Return exchange-published settlement prices for all SHFE contracts."""
+        ak = self._ensure_akshare()
+        if ak is None:
+            return pd.DataFrame(columns=["contract", "close"])
+        try:
+            raw = ak.get_futures_daily(
+                start_date=on_date.strftime("%Y%m%d"),
+                end_date=on_date.strftime("%Y%m%d"),
+                market="SHFE",
+            )
+        except Exception as exc:
+            logger.debug("SHFE daily price fetch failed for %s: %s", on_date, exc)
+            return pd.DataFrame(columns=["contract", "close"])
+        if raw is None or raw.empty or not {"symbol", "settle"}.issubset(raw.columns):
+            return pd.DataFrame(columns=["contract", "close"])
+        result = pd.DataFrame({
+            "contract": raw["symbol"].astype(str).str.lower(),
+            "close": pd.to_numeric(raw["settle"], errors="coerce"),
+        })
+        return result.dropna(subset=["close"])[lambda frame: frame["close"] > 0].reset_index(drop=True)
+
     # ------------------------------------------------------------------
     # Normalization helpers
     # ------------------------------------------------------------------

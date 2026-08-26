@@ -681,6 +681,13 @@ def _principal_component_summary(y: np.ndarray, X: pd.DataFrame) -> list[dict]:
 
 def _run_ols_regression(y: np.ndarray, X: pd.DataFrame) -> list[FactorExposureDetail]:
     """Run OLS and extract per-factor statistics."""
+    # Guard against non-finite inputs: a NaN/Inf return or proxy would make
+    # lstsq emit NaN betas and meaningless t/p statistics downstream.
+    frame = X.assign(__y_dependent__=np.asarray(y, dtype=float)).replace([np.inf, -np.inf], np.nan).dropna()
+    if frame.empty:
+        return []
+    X = frame.drop(columns=["__y_dependent__"])
+    y = frame["__y_dependent__"].to_numpy(dtype=float)
     X_arr = X.values
     n, k = X_arr.shape
 

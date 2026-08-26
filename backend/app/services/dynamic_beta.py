@@ -8,8 +8,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-
-DYNAMIC_FACTOR_NAMES = ("trend", "basis_carry", "short_term_trend_20", "mean_reversion_5d")
+DYNAMIC_FACTOR_NAMES = ("trend", "term_structure_carry", "short_term_trend_20", "mean_reversion_5d")
+INTERACTION_FACTOR_NAMES = ("short_term_trend_20", "volatility_state")
 MIN_DYNAMIC_OBSERVATIONS = 19  # 20 NAV points produce 19 period returns.
 
 
@@ -24,7 +24,7 @@ def prepare_factor_matrix(
     This function only reads the factor cache. It deliberately does not build
     factors, fetch market data, or inspect source materials.
     """
-    from app.services import factor_library
+    from app.services.cta_factor_bundle import get_cta_factor_bundle, get_factor_series
     from app.services.factor_library.factor_regression import _aggregate_returns, _frequency_index
 
     if len(product_returns) != len(product_dates):
@@ -47,11 +47,15 @@ def prepare_factor_matrix(
     factor_series: dict[str, pd.Series] = {}
     warnings: list[str] = []
     for name in factor_names:
-        raw = factor_library.get_factor_series(name, risk_profile="baseline")
+        raw = get_factor_series(name, as_of_date=max(product_dates))
         if raw is None or raw.empty:
-            warnings.append(f"因子 '{name}' 没有已缓存的 baseline 收益，已跳过。")
+            warnings.append(f"因子 '{name}' 在 cta_factor_bundle_v1 截止日前未覆盖，已跳过。")
             continue
-        aggregated = _aggregate_returns(raw, frequency)
+        if name == "volatility_state":
+            periods = _frequency_index(raw.index, frequency)
+            aggregated = raw.groupby(periods).last().dropna()
+        else:
+            aggregated = _aggregate_returns(raw, frequency)
         if aggregated is None or aggregated.empty:
             warnings.append(f"因子 '{name}' 在当前频率没有可用收益，已跳过。")
             continue
@@ -90,16 +94,18 @@ def prepare_factor_matrix(
             f"剔除缺失因子后仅有 {len(x)} 个观测，至少需要 {MIN_DYNAMIC_OBSERVATIONS} 个"
         )
     aligned_dates = []
-    for value in date_periodic.loc[common_idx].tolist():
+    for value in date_periodic.loc[aligned_returns.index].tolist():
         timestamp = pd.Timestamp(value)
         aligned_dates.append(timestamp.date())
+    bundle_manifest = get_cta_factor_bundle(as_of_date=max(product_dates))
     return {
         "returns": aligned_returns.to_numpy(dtype=float),
         "factor_returns": x.to_numpy(dtype=float),
         "dates": aligned_dates,
         "factor_names": list(x.columns),
         "warnings": warnings,
-        "observation_count": len(common_idx),
+        "observation_count": len(aligned_returns),
+        "factor_bundle": bundle_manifest,
     }
 
 

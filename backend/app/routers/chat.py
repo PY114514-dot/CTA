@@ -8,9 +8,11 @@ user has enabled an LLM it is used only to synthesize those audited results.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from statistics import median
 from datetime import date
@@ -18,26 +20,31 @@ from time import perf_counter
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.database import get_session
 from app.dependencies import get_report_config
-from app.models import NavObservation, ProductEntity, RawFile
+from app.models import AgentRun, DataSnapshot, DecisionRecord, NavObservation, ProductEntity, RawFile
 from app.services import product_store as store
 from app.services.upload_storage import resolve_upload_path
 from app.services import retrieval
 from app.services import quant_screen
+from app.services.agent_memory import load_preferences, remember_preferences
+from app.services.agent_tools import build_plan, validate_requested_tools
+from app.services.allocation_agent_graph import request_allocation_approval, run_allocation_agent
 from app.services.fof_allocation_intent import (
     is_demo_product,
     is_screening_candidate,
+    parse_allocation_intent,
 )
 from app.services.fof_allocation_research import build_allocation_research
 from app.services.nav_metrics import calculate_nav_analysis
 from app.services.nav_quality import assess_nav_quality as assess_product_nav_quality
 from app.services.chart_extractor.vlm_extractor import DashScopeProvider, OpenAICompatibleProvider
 from app.schemas import NavAnalysisRequest, NetAssetValuePoint, DataFrequency
+from app.routers.cta_attribution import evaluate_reviewed_product
 
 router = APIRouter(prefix="/api/kb", tags=["产品知识库"])
 logger = logging.getLogger(__name__)
@@ -81,13 +88,11 @@ class ChatAllocationItem(BaseModel):
 
 class ChatAllocationDraft(BaseModel):
     goal: str
-    hard_constraints: list[str] = Field(default_factory=list)
-    soft_preferences: list[str] = Field(default_factory=list)
+    draft_id: str = ""
     allocations: list[ChatAllocationItem] = Field(default_factory=list)
     exclusions: list[dict[str, Any]] = Field(default_factory=list)
     risk_warnings: list[str] = Field(default_factory=list)
-    due_diligence_gaps: list[str] = Field(default_factory=list)
-    snapshot_id: str | None = None
+    portfolio: dict[str, Any] | None = None
 
 
 class ChatMessage(BaseModel):
@@ -99,6 +104,50 @@ class ChatMessage(BaseModel):
     data_context: list[dict[str, Any]] = Field(default_factory=list)
     method_provenance: dict[str, Any] = Field(default_factory=dict)
     allocation_draft: ChatAllocationDraft | None = None
+
+
+class SaveAllocationDraftRequest(BaseModel):
+    draft_id: str
+
+
+@router.post("/chat/allocation-drafts")
+def save_allocation_draft(body: SaveAllocationDraftRequest, session: Session = Depends(get_session)) -> dict[str, str]:
+    """Save a calculated configuration only after the user explicitly asks."""
+    snapshot = session.get(DataSnapshot, body.draft_id)
+    if snapshot is None or snapshot.label != "FOF 配置研究快照":
+        raise HTTPException(404, "未找到可保存的配置研究快照")
+    draft = (snapshot.content or {}).get("draft")
+    if not isinstance(draft, dict) or not draft.get("allocations"):
+        raise HTTPException(422, "该研究快照没有可保存的配置")
+    decision = store.create_decision(
+        session, decision_type="allocation", title="FOF 配置研究草案",
+        content={
+            **draft,
+            "interpreted_constraints": (snapshot.content or {}).get("interpreted_constraints", {}),
+            "source_draft_snapshot_id": snapshot.id,
+            "workflow": {"stage": "draft", "tracking_enabled": False},
+        },
+        data_snapshot_id=snapshot.id, status="draft",
+    )
+    return {"id": decision.id, "status": decision.status}
+
+
+@router.post("/chat/allocation-drafts/{decision_id}/submit")
+def submit_allocation_draft(decision_id: str, session: Session = Depends(get_session)) -> dict[str, str]:
+    """Enter the LangGraph pause; this never approves or executes a draft."""
+    decision = session.get(DecisionRecord, decision_id)
+    if decision is None or decision.decision_type != "allocation":
+        raise HTTPException(404, "未找到配置草案")
+    if decision.status != "draft":
+        raise HTTPException(409, "该配置草案已提交或已完成审批")
+    if not request_allocation_approval(decision.id, decision.content or {}).waiting_for_human:
+        raise HTTPException(500, "审批工作流未能进入人工确认节点")
+    decision.status = "pending_review"
+    content = dict(decision.content or {})
+    content["workflow"] = {"stage": "awaiting_human_approval", "tracking_enabled": False}
+    decision.content = content
+    session.commit()
+    return {"id": decision.id, "status": decision.status}
 
 
 # ---------------------------------------------------------------------------
@@ -117,10 +166,89 @@ _INTENT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 def _detect_intent(query: str) -> str:
+    # 明确的比较请求始终优先，不能被“最多几只、收益/回撤”等配置词误判。
+    if _INTENT_PATTERNS[0][1].search(query):
+        return "compare"
+    # 用户常直接回复一组配置约束，而不会重复说“配置”或“FOF”。此时不能因
+    # “收益、波动”落入单产品净值查询；配置候选池本来就不依赖已选路演材料。
+    allocation = parse_allocation_intent(query)
+    if allocation.max_products is not None and (
+        allocation.min_annualized_return is not None
+        or allocation.max_annualized_volatility is not None
+        or allocation.max_drawdown is not None
+    ):
+        return "recommend"
     for intent, pattern in _INTENT_PATTERNS:
         if pattern.search(query):
             return intent
     return "describe"
+
+
+def _awaits_allocation_preferences(session: Session, session_id: str | None) -> bool:
+    if not session_id:
+        return False
+    previous = session.query(AgentRun).filter(AgentRun.session_id == session_id).order_by(AgentRun.created_at.desc()).first()
+    return bool(previous and (previous.plan or {}).get("intent") == "recommend_clarification")
+
+
+def _has_allocation_preferences(query: str) -> bool:
+    return bool(re.search(r"\d+(?:\.\d+)?\s*%|(?:最多|不超过|至多)\s*\d+\s*(?:只|个|款)?", query))
+
+
+def _needs_allocation_clarification(intent: Any) -> bool:
+    """A return target or a risk limit is enough to start a bounded draft."""
+    return intent.min_annualized_return is None and intent.max_drawdown is None and intent.max_annualized_volatility is None
+
+
+def _allocation_clarification() -> str:
+    return (
+        "开始配置前，请至少给出一个明确目标：目标年化收益，或最大回撤/年化波动上限。\n\n"
+        "例如：年化收益至少 10%；或最大回撤不超过 10%。未指定产品数量时，系统默认最多配置 5 只产品。"
+    )
+
+
+def _interpret_allocation_constraints(query: str, config: Any) -> dict[str, object] | None:
+    """Ask the LLM for a small constraint contract, then validate locally.
+
+    This is language understanding only.  The optimizer still receives only
+    validated numeric fields and never executes prose supplied by the model.
+    """
+    if not config.enabled:
+        return None
+    payload = {
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": "你只做中文 FOF 配置需求的语义提取，不推荐产品、不计算、不解释。输出 JSON。"},
+            {"role": "user", "content": (
+                "从用户原话提取配置约束。字段只能是 max_products、max_drawdown、"
+                "min_annualized_return、max_annualized_volatility、requested_tools；百分比转为 0 到 1 的小数。"
+                "“最多、不超过、至多、最好不超过、尽量不超过”均提取 max_products。"
+                "requested_tools 只能从 interpret_allocation_constraints、search_products、optimize_fof_allocation 中选择；"
+                "它只是建议，不能执行任何操作。没有明确数值则填 null。只输出 JSON。\n\n用户原话：" + query
+            )},
+        ],
+        "temperature": 0,
+        "max_tokens": min(160, config.max_tokens),
+        "response_format": {"type": "json_object"},
+    }
+    if config.model.lower().startswith("deepseek-") and not config.thinking_enabled:
+        payload["thinking"] = {"type": "disabled"}
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            response = client.post(
+                f"{config.api_base.rstrip('/')}/chat/completions",
+                headers={"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"},
+                json=payload,
+            )
+            response.raise_for_status()
+        content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+        parsed = json.loads(content)
+    except Exception as error:
+        logger.warning("Allocation constraint interpretation failed: %s", error)
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -133,9 +261,30 @@ def chat(body: ChatRequest, session: Session = Depends(get_session)) -> ChatMess
     """Process a natural language query with retrieval and deterministic tools."""
     started = perf_counter()
     intent = _detect_intent(body.query)
+    if intent != "recommend" and _awaits_allocation_preferences(session, body.session_id):
+        intent = "recommend"
+    config = get_report_config()
+    constraint_started = perf_counter()
+    semantic_constraints = _interpret_allocation_constraints(body.query, config) if intent == "recommend" else None
+    preliminary_intent = parse_allocation_intent(body.query, semantic_constraints)
+    needs_allocation_clarification = intent == "recommend" and _needs_allocation_clarification(preliminary_intent)
     tool_calls: list[ChatToolCall] = []
     citations: list[ChatCitation] = []
     products_referenced: list[dict[str, Any]] = []
+    if intent == "recommend" and semantic_constraints is not None:
+        accepted, rejected = validate_requested_tools(intent, semantic_constraints.get("requested_tools"))
+        tool_calls.append(ChatToolCall(
+            name="validate_agent_plan",
+            status="ok",
+            summary=(f"LLM 建议：{'、'.join(accepted) or '无'}；实际执行仍由固定工作流决定" + (f"；已拒绝：{'、'.join(rejected)}" if rejected else "")),
+        ))
+    if needs_allocation_clarification:
+        tool_calls.append(ChatToolCall(
+            name="interpret_allocation_constraints",
+            status="ok" if semantic_constraints is not None else "error",
+            duration_ms=(perf_counter() - constraint_started) * 1000,
+            summary="尚未识别到目标收益或风险上限；先向用户确认",
+        ))
 
     # UI state can outlive a product deletion or a status change.  Never let
     # stale IDs (or records explicitly marked "not a product") masquerade as
@@ -148,7 +297,7 @@ def chat(body: ChatRequest, session: Session = Depends(get_session)) -> ChatMess
             ignored_ids.append(product_id)
         else:
             selected_ids.append(product_id)
-    if body.product_ids and not selected_ids:
+    if body.product_ids and not selected_ids and intent not in {"screen", "recommend"}:
         return ChatMessage(
             content="当前选择的产品已被删除、标记为“不是产品”，或尚未形成有效记录，因此没有可分析的净值数据。请在左侧选择“待确认”或“已确认”的正式产品后重试。",
             tool_calls=[ChatToolCall(
@@ -176,7 +325,7 @@ def chat(body: ChatRequest, session: Session = Depends(get_session)) -> ChatMess
         quality = assess_product_nav_quality(product.nav_observations, product.facts)
         if quality["blocking"]:
             blocked_products.append((product, quality))
-    if blocked_products:
+    if blocked_products and intent not in {"screen", "recommend"}:
         product, quality = blocked_products[0]
         reasons = "；".join(quality["reasons"])
         return ChatMessage(
@@ -203,19 +352,22 @@ def chat(body: ChatRequest, session: Session = Depends(get_session)) -> ChatMess
             },
         )
 
-    # --- Retrieve phase ---
-    retrieval_started = perf_counter()
-    retrieval_result = retrieval.retrieve(
-        session, body.query,
-        product_ids=selected_ids or None,
-        limit=12,
-    )
-    tool_calls.append(ChatToolCall(
-        name="search_products",
-        status="ok",
-        duration_ms=(perf_counter() - retrieval_started) * 1000,
-        summary=f"检索到 {retrieval_result.total} 条证据",
-    ))
+    # Asking for missing allocation constraints is a conversation turn, not a
+    # retrieval task. Do not read arbitrary materials before asking the user.
+    retrieval_result = retrieval.RetrievalResponse(query=body.query, results=[], total=0)
+    if not needs_allocation_clarification:
+        retrieval_started = perf_counter()
+        retrieval_result = retrieval.retrieve(
+            session, body.query,
+            product_ids=selected_ids or None,
+            limit=12,
+        )
+        tool_calls.append(ChatToolCall(
+            name="search_products",
+            status="ok",
+            duration_ms=(perf_counter() - retrieval_started) * 1000,
+            summary=f"检索到 {retrieval_result.total} 条证据",
+        ))
 
     # Collect citations from retrieval results.
     for result in retrieval_result.results:
@@ -243,13 +395,17 @@ def chat(body: ChatRequest, session: Session = Depends(get_session)) -> ChatMess
     if intent == "nav" and selected_ids:
         content = _handle_nav_query(session, selected_ids, tool_calls)
     elif intent == "screen":
-        content = _handle_screen_query(session, body.query, retrieval_result, products_referenced, tool_calls)
+        content = _handle_screen_query(session, body.query, tool_calls)
     elif intent == "compare":
         content = _handle_compare_query(session, selected_ids, tool_calls)
     elif intent == "recommend":
-        content, allocation_draft = _handle_recommend_query(
-            session, body.query, selected_ids, tool_calls, citations
-        )
+        if needs_allocation_clarification:
+            content = _allocation_clarification()
+        else:
+            content, allocation_draft = _handle_recommend_query(
+                session, body.query, tool_calls, citations, session_id=body.session_id,
+                semantic_constraints=semantic_constraints,
+            )
     elif selected_ids:
         content = _handle_selected_product_overview(session, selected_ids, tool_calls)
     else:
@@ -263,8 +419,7 @@ def chat(body: ChatRequest, session: Session = Depends(get_session)) -> ChatMess
     # constrained research writer, never a substitute for calculation.
     context_ids = selected_ids or [p["id"] for p in products_referenced if p.get("id")]
     data_context = _build_data_context(session, context_ids)
-    config = get_report_config()
-    if config.enabled:
+    if config.enabled and not needs_allocation_clarification and intent != "recommend":
         image_evidence = ""
         image_started = perf_counter()
         # Source-image evidence may enrich a product description, but it is
@@ -290,17 +445,30 @@ def chat(body: ChatRequest, session: Session = Depends(get_session)) -> ChatMess
                 ))
         llm_started = perf_counter()
         try:
-            content = _synthesize_with_llm(content, body.query, data_context, config, image_evidence)
+            if intent == "compare":
+                content = _interpret_comparison_with_llm(content, body.query, config)
+                tool_name = "llm_comparison_interpretation"
+                tool_summary = "已基于确定性对比结果生成差异化解读"
+            else:
+                scope_note = (
+                    "本次为产品库筛选或 FOF 配置：候选范围由工具结果中的“产品库”说明确定，"
+                    "不受当前单品研究对象限制。"
+                    if intent in {"screen", "recommend"}
+                    else "本次只分析当前单品研究对象。"
+                )
+                content = _synthesize_with_llm(content, body.query, data_context, config, image_evidence, scope_note)
+                tool_name = "llm_research_synthesis"
+                tool_summary = f"已使用 {config.model} 基于工具结果生成解读"
             tool_calls.append(ChatToolCall(
-                name="llm_research_synthesis",
+                name=tool_name,
                 status="ok",
                 duration_ms=(perf_counter() - llm_started) * 1000,
-                summary=f"已使用 {config.model} 基于工具结果生成解读",
+                summary=tool_summary,
             ))
         except Exception as error:
             logger.warning("LLM agent synthesis failed, using deterministic answer: %s", error)
             tool_calls.append(ChatToolCall(
-                name="llm_research_synthesis",
+                name="llm_comparison_interpretation" if intent == "compare" else "llm_research_synthesis",
                 status="error",
                 duration_ms=(perf_counter() - llm_started) * 1000,
                 summary="LLM 调用失败，已回退到工具计算结果",
@@ -311,7 +479,12 @@ def chat(body: ChatRequest, session: Session = Depends(get_session)) -> ChatMess
         session,
         user_query=body.query,
         session_id=body.session_id,
-        plan={"intent": intent, "product_ids": selected_ids, "ignored_product_ids": ignored_ids},
+        plan={
+            "intent": "recommend_clarification" if needs_allocation_clarification else intent,
+            "product_ids": selected_ids,
+            "ignored_product_ids": ignored_ids,
+            "allowed_tools": build_plan(intent),
+        },
     )
     for tc in tool_calls:
         store.add_tool_invocation(
@@ -327,7 +500,12 @@ def chat(body: ChatRequest, session: Session = Depends(get_session)) -> ChatMess
         tools_used=[tc.name for tc in tool_calls],
         citations=[c.model_dump() for c in citations],
         answer=content[:500],
-        data_snapshot_id=allocation_draft.snapshot_id if allocation_draft else None,
+        reflection={
+            "outcome": "needs_clarification" if needs_allocation_clarification else "completed",
+            "tool_failures": [tc.name for tc in tool_calls if tc.status != "ok"],
+            "next_step": "补充配置取舍" if needs_allocation_clarification else "查看结论或继续追问",
+        },
+        data_snapshot_id=allocation_draft.draft_id if allocation_draft else None,
         duration_ms=(perf_counter() - started) * 1000,
     )
 
@@ -362,6 +540,7 @@ def _synthesize_with_llm(
     data_context: list[dict[str, Any]],
     config: Any,
     image_evidence: str = "",
+    scope_note: str = "",
 ) -> str:
     """Use an LLM only to explain audited output produced by local tools."""
     context_lines = []
@@ -380,29 +559,81 @@ def _synthesize_with_llm(
         "如果数据标为待复核，必须简短提示；保留产品名、重要数值和筛选规则；"
         "使用简洁专业的中文，不要说你调用了 LLM。\n\n"
         f"【用户问题】\n{question}\n\n"
+        f"【候选范围规则】\n{scope_note}\n\n"
         f"【本次数据范围】\n{context_text}\n\n"
         f"【视觉模型补充证据】\n{image_evidence or '未使用视觉模型补充证据。'}\n\n"
         f"【工具计算结果】\n{raw_answer}"
     )
+    payload = {
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": "你是严谨的量化研究写作助手，绝不虚构或修改已计算数值。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": min(1800 if config.thinking_enabled else 900, config.max_tokens),
+    }
+    if config.model.lower().startswith("deepseek-") and not config.thinking_enabled:
+        payload["thinking"] = {"type": "disabled"}
     with httpx.Client(timeout=30.0) as client:
         response = client.post(
             f"{config.api_base.rstrip('/')}/chat/completions",
             headers={"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"},
-            json={
-                "model": config.model,
-                "messages": [
-                    {"role": "system", "content": "你是严谨的量化研究写作助手，绝不虚构或修改已计算数值。"},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.2,
-                "max_tokens": 900,
-            },
+            json=payload,
         )
         response.raise_for_status()
         content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
         if not content:
             raise ValueError("模型返回空内容")
     return content
+
+
+def _interpret_comparison_with_llm(raw_answer: str, question: str, config: Any) -> str:
+    """Turn audited comparison facts into a decision-specific explanation.
+
+    This path deliberately differs from report synthesis: it asks for the
+    material trade-off implied by the user's question, not a sectioned replay
+    of every metric.  All numerical facts still come from ``raw_answer``.
+    """
+    prompt = (
+        "你是量化产品比较助手。只基于下方已计算结果回答，不能补造或改写任何数值、"
+        "策略归因、管理人信息或风险判断。\n"
+        "你的任务不是逐项复述指标，也不要使用“配置角色、收益比较、回撤比较、分散化价值、提示”"
+        "之类固定标题。先针对用户问题给一句明确结论；再用不超过三条短句解释真正影响选择的差异；"
+        "最后只在数据确实不足或相关性不支持判断时补一句限制。\n"
+        "若用户问二选一，说明不同目标下各自更适合的条件；若用户问是否组合，围绕相关性和风险收益取舍回答；"
+        "若问题没有给出决策场景，说明最关键的取舍并建议用户补充一个场景。保持简洁、专业的中文，不要说你调用了 LLM。\n\n"
+        f"【用户问题】\n{question}\n\n"
+        f"【已计算对比结果】\n{raw_answer}"
+    )
+    payload = {
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": "你只能解释已计算的产品差异，不得把固定模板伪装成研究结论。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": min(700, config.max_tokens),
+    }
+    if config.model.lower().startswith("deepseek-") and not config.thinking_enabled:
+        payload["thinking"] = {"type": "disabled"}
+    with httpx.Client(timeout=30.0) as client:
+        response = client.post(
+            f"{config.api_base.rstrip('/')}/chat/completions",
+            headers={"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"},
+            json=payload,
+        )
+        response.raise_for_status()
+        content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        if not content:
+            raise ValueError("模型返回空内容")
+    return content
+
+
+def _run_async(coro):
+    """Run an async coroutine from sync code without conflicting with the running event loop."""
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="async-runner") as pool:
+        return pool.submit(asyncio.run, coro).result()
 
 
 def _inspect_source_images(session: Session, product_ids: list[str]) -> tuple[str, int]:
@@ -458,7 +689,7 @@ def _inspect_source_images(session: Session, product_ids: list[str]) -> tuple[st
             continue
         if not path.is_file():
             continue
-        response = asyncio.run(provider.extract_structure(path.read_bytes(), prompt))
+        response = _run_async(provider.extract_structure(path.read_bytes(), prompt))
         evidence.append(f"{record.filename}：{response.strip()[:800]}")
     return "\n".join(evidence), len(evidence)
 
@@ -557,22 +788,14 @@ def _handle_nav_query(
 def _handle_screen_query(
     session: Session,
     query: str,
-    retrieval_result: retrieval.RetrievalResponse,
-    products_referenced: list[dict[str, Any]],
     tool_calls: list[ChatToolCall],
 ) -> str:
-    """Screen products using quantitative rules."""
-    # Gather candidate product IDs from retrieval + referenced products.
-    candidate_ids = list({p["id"] for p in products_referenced if p.get("id")})
+    """Screen every confirmed, reviewed product in the product library."""
     candidate_ids = [
-        product_id for product_id in candidate_ids
-        if (product := session.get(ProductEntity, product_id)) is not None and is_screening_candidate(product)
+        product.id
+        for product in session.query(ProductEntity).all()
+        if is_screening_candidate(product)
     ]
-    if not candidate_ids:
-        # Never fall back to historical sample series.  This is the normal
-        # path when the user asks a broad question with no products selected.
-        all_products = session.query(ProductEntity).all()
-        candidate_ids = [product.id for product in all_products if is_screening_candidate(product)]
 
     if not candidate_ids:
         return "当前没有可用于筛选的已确认真实产品。请先核对上传解析结果，并确认至少一个具有净值数据的产品。"
@@ -593,10 +816,10 @@ def _handle_screen_query(
         name="screen_products",
         status="ok",
         duration_ms=(perf_counter() - started) * 1000,
-        summary=f"{len(passed)} 通过 / {len(excluded)} 剔除（共 {len(results)} 个）",
+        summary=f"产品库：{len(passed)} 通过 / {len(excluded)} 剔除（共 {len(results)} 个）",
     ))
 
-    lines: list[str] = [f"筛选规则：最低 {rules.min_observations} 期"]
+    lines: list[str] = [f"产品库筛选：共检查 {len(candidate_ids)} 个已确认、净值已复核产品。", f"筛选规则：最低 {rules.min_observations} 期"]
     if rules.max_drawdown:
         lines[0] += f" | 回撤 ≤ {rules.max_drawdown:.0%}"
     if rules.min_sharpe:
@@ -641,31 +864,37 @@ def _handle_compare_query(
         summary=f"对比 {len(result.products)} 个产品",
     ))
 
-    lines: list[str] = []
+    lines: list[str] = ["已按已复核净值完成直接对比。"]
     if result.aligned_window:
-        lines.append(f"对齐窗口：{result.aligned_window}\n")
+        lines.append(f"共同区间：{result.aligned_window}")
 
-    # Metrics table.
-    lines.append("| 产品 | 期数 | 年化收益 | 波动率 | 夏普 | 最大回撤 | 卡玛 |")
-    lines.append("|---|---|---|---|---|---|---|")
-    for p in result.products:
-        sharpe = f"{p.sharpe_ratio:.2f}" if p.sharpe_ratio is not None else "—"
-        calmar = f"{p.calmar_ratio:.2f}" if p.calmar_ratio is not None else "—"
+    for product in result.products:
+        sharpe = f"{product.sharpe_ratio:.2f}" if product.sharpe_ratio is not None else "—"
+        calmar = f"{product.calmar_ratio:.2f}" if product.calmar_ratio is not None else "—"
         lines.append(
-            f"| {p.product_name} | {p.observation_count} | {p.annualized_return:.2%} | "
-            f"{p.annualized_volatility:.2%} | {sharpe} | {p.maximum_drawdown:.2%} | {calmar} |"
+            f"{product.product_name}：年化收益 {product.annualized_return:.2%} · 年化波动 "
+            f"{product.annualized_volatility:.2%} · 最大回撤 {product.maximum_drawdown:.2%} · "
+            f"夏普 {sharpe} · 卡玛 {calmar}"
         )
 
-    # Correlation matrix.
-    if len(product_ids) >= 2 and result.correlation_matrix:
-        lines.append("\n**相关性矩阵：**")
-        names = {p.product_id: p.product_name for p in result.products}
-        for pid_a in product_ids:
-            corrs = []
-            for pid_b in product_ids:
-                val = result.correlation_matrix.get(pid_a, {}).get(pid_b, 0)
-                corrs.append(f"{val:.2f}")
-            lines.append(f"  {names.get(pid_a, pid_a)}：{' | '.join(corrs)}")
+    if len(result.products) == 2:
+        left, right = result.products
+        return_gap = left.annualized_return - right.annualized_return
+        if abs(return_gap) >= 0.001:
+            higher = left if return_gap > 0 else right
+            lines.append(f"收益：{higher.product_name}年化收益高 {abs(return_gap):.2%}。")
+
+        drawdown_gap = left.maximum_drawdown - right.maximum_drawdown
+        if abs(drawdown_gap) >= 0.001:
+            shallower = left if drawdown_gap > 0 else right
+            lines.append(f"回撤：{shallower.product_name}最大回撤更浅 {abs(drawdown_gap):.2%}。")
+
+        correlation = result.correlation_matrix.get(left.product_id, {}).get(right.product_id)
+        if correlation is not None:
+            correlation_readout = "低相关，具备分散价值" if correlation <= 0.2 else "高度相关，分散价值有限" if correlation >= 0.8 else "相关性中等"
+            lines.append(f"相关性：{correlation:.2f}，{correlation_readout}。")
+
+    lines.append("需要查看净值叠加、指标差异或因子并排时，请使用“产品对比”面板。")
 
     return "\n".join(lines)
 
@@ -673,12 +902,54 @@ def _handle_compare_query(
 def _handle_recommend_query(
     session: Session,
     query: str,
-    product_ids: list[str],
     tool_calls: list[ChatToolCall],
     citations: list[ChatCitation],
+    config: Any | None = None,
+    session_id: str | None = None,
+    semantic_constraints: dict[str, object] | None = None,
 ) -> tuple[str, ChatAllocationDraft | None]:
     """Adapt allocation research output to the HTTP chat response contract."""
-    research = build_allocation_research(session, query, product_ids)
+    started = perf_counter()
+    if semantic_constraints is None:
+        semantic_constraints = _interpret_allocation_constraints(query, config or get_report_config())
+    remembered = load_preferences(session, session_id)
+    interpreted = {**remembered, **{key: value for key, value in (semantic_constraints or {}).items() if value is not None}}
+    intent = parse_allocation_intent(query, interpreted)
+    interpreted_parts = []
+    if intent.min_annualized_return is not None:
+        interpreted_parts.append(f"年化收益≥{intent.min_annualized_return:.0%}")
+    if intent.max_annualized_volatility is not None:
+        interpreted_parts.append(f"年化波动≤{intent.max_annualized_volatility:.0%}")
+    if intent.max_drawdown is not None:
+        interpreted_parts.append(f"最大回撤≤{intent.max_drawdown:.0%}")
+    if intent.max_products is not None:
+        interpreted_parts.append(f"产品数≤{intent.max_products}只")
+    if semantic_constraints is not None:
+        tool_calls.append(ChatToolCall(
+            name="interpret_allocation_constraints",
+            status="ok",
+            duration_ms=(perf_counter() - started) * 1000,
+            summary="；".join(interpreted_parts) or "未识别到带数值的配置约束",
+        ))
+    else:
+        tool_calls.append(ChatToolCall(
+            name="interpret_allocation_constraints",
+            status="error",
+            duration_ms=(perf_counter() - started) * 1000,
+            summary="语义约束解析不可用，仅采用明确的本地数值约束",
+        ))
+    agent_result = run_allocation_agent(session, query, intent)
+    research = agent_result.research
+    tool_calls.append(ChatToolCall(
+        name="run_allocation_agent",
+        status="ok",
+        summary=f"LangGraph 已完成 {len(agent_result.plan)} 个受控步骤；配置校验通过",
+    ))
+    remember_preferences(
+        session,
+        session_id,
+        {key: value for key, value in (semantic_constraints or {}).items() if value is not None},
+    )
     if research.tool_summary:
         tool_calls.append(ChatToolCall(
             name="optimize_fof_allocation",
@@ -686,12 +957,10 @@ def _handle_recommend_query(
             duration_ms=research.tool_duration_ms,
             summary=research.tool_summary,
         ))
-    existing_keys = {(citation.file_id, citation.fragment_id) for citation in citations}
-    for evidence in research.citations or []:
-        key = (evidence["file_id"], evidence["fragment_id"])
-        if key not in existing_keys:
-            citations.append(ChatCitation(**evidence))
-            existing_keys.add(key)
+    # The allocation snapshot retains every linked source for audit.  They are
+    # not all evidence used by this answer, so do not append them as chat
+    # citations.  The query retrieval above is the only citation set shown to
+    # the user.
     return research.content, ChatAllocationDraft(**research.draft) if research.draft else None
 
 
@@ -727,17 +996,74 @@ def _handle_selected_product_overview(
     series from a request about performance or risk.
     """
     metrics = _handle_nav_query(session, product_ids, tool_calls)
-    missing_evidence = []
-    for product_id in product_ids[:5]:
-        product = session.get(ProductEntity, product_id)
-        if product is not None and not product.facts:
-            missing_evidence.append(product.standard_name)
-    evidence_note = (
-        "\n\n策略与管理人资料尚未提取为可引用证据：请补充周报或事实表；"
-        "以上收益与风险指标仅来自已复核净值序列。"
-        if missing_evidence else ""
+    attribution = [
+        _handle_attribution_summary(session, product_id, tool_calls)
+        for product_id in product_ids[:3]
+    ]
+    return "\n\n".join([metrics, *filter(None, attribution)])
+
+
+def _handle_attribution_summary(
+    session: Session, product_id: str, tool_calls: list[ChatToolCall]
+) -> str:
+    """Add a compact deterministic attribution and risk readout to Agent research.
+
+    The Phase-A result is the same reviewed-NAV attribution shown in the CTA
+    panel.  It is deliberately summarized here rather than delegated to the
+    LLM, so the research conclusion remains traceable and does not fall back
+    to manager-material boilerplate when no disclosure is available.
+    """
+    started = perf_counter()
+    try:
+        result = evaluate_reviewed_product(product_id, session)
+    except Exception as error:
+        tool_calls.append(ChatToolCall(
+            name="analyze_attribution_risk",
+            status="error",
+            duration_ms=(perf_counter() - started) * 1000,
+            summary="归因暂不可用，保留净值风险评价",
+        ))
+        return ""
+
+    performance = result["performance_path"]
+    baseline = result["baseline"]
+    exposures = result["attribution"]["factor_exposure"]
+    significant = [item for item in exposures if item.get("hac_p_value", 1.0) < 0.05]
+    main_exposure = max(significant, key=lambda item: abs(item["beta"])) if significant else None
+    oos = baseline.get("out_of_sample", {})
+    applicability = result["model_applicability"]
+
+    risk = (
+        f"风险：最大回撤 {performance['maximum_drawdown']:.2%}，"
+        f"最差 5% 平均亏损 {performance['expected_shortfall_5pct']:.2%}，"
+        f"卡玛 {performance['calmar']:.3g}"
     )
-    return metrics + evidence_note
+    if performance.get("recovery_completed") is False:
+        risk += f"，当前回撤已持续 {performance['current_drawdown_duration_periods']} 期"
+
+    attribution = f"归因：样本内 R² {baseline['r_squared']:.2f}"
+    if oos.get("r_squared") is not None:
+        attribution += f"，样本外 R² {oos['r_squared']:.2f}"
+    if main_exposure is None:
+        attribution += "；当前公开因子中未发现 p<0.05 的显著关联。"
+    else:
+        label = main_exposure.get("display_name") or main_exposure["factor_name"]
+        p_value = main_exposure["hac_p_value"]
+        p_text = "p<0.001" if p_value < 0.001 else f"p={p_value:.3f}"
+        attribution += f"；主要统计关联为{label}（系数 {main_exposure['beta']:.3f}，{p_text}）。"
+
+    tool_calls.append(ChatToolCall(
+        name="analyze_attribution_risk",
+        status="ok",
+        duration_ms=(perf_counter() - started) * 1000,
+        summary=f"{result['product_name']}：R² {baseline['r_squared']:.2f}，{applicability['status']}",
+    ))
+    return (
+        f"**{result['product_name']} · 归因与风险评价：**\n"
+        f"- {risk}。\n"
+        f"- {attribution}\n"
+        f"- 归因适用性：{applicability['reason']}"
+    )
 
 
 def _fallback_answer(retrieval_result: retrieval.RetrievalResponse, intent: str) -> str:

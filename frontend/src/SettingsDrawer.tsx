@@ -7,6 +7,7 @@ import {
   InputNumber,
   Popconfirm,
   Select,
+  Switch,
   Tag,
   Typography,
 } from "antd";
@@ -116,6 +117,8 @@ interface LlmFormState {
   apiBase: string;
   apiKey: string;
   model: string;
+  thinkingEnabled: boolean;
+  maxTokens: number;
 }
 
 function loadLlmForm(): LlmFormState {
@@ -128,12 +131,14 @@ function loadLlmForm(): LlmFormState {
         apiBase: parsed.apiBase ?? "",
         apiKey: parsed.apiKey ?? "",
         model: parsed.model ?? "",
+        thinkingEnabled: parsed.thinkingEnabled ?? false,
+        maxTokens: typeof parsed.maxTokens === "number" ? Math.max(128, Math.min(1200, Math.round(parsed.maxTokens))) : 900,
       };
     }
   } catch {
     // Corrupt storage falls through to defaults.
   }
-  return { provider: "deepseek", apiBase: PROVIDER_PRESETS[0]!.apiBase, apiKey: "", model: PROVIDER_PRESETS[0]!.model };
+  return { provider: "deepseek", apiBase: PROVIDER_PRESETS[0]!.apiBase, apiKey: "", model: PROVIDER_PRESETS[0]!.model, thinkingEnabled: false, maxTokens: 900 };
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +230,7 @@ export default function SettingsDrawer({
       // Runtime settings disappear when a local backend is restarted. Restore
       // the user-approved browser-local setting and then verify the response.
       if (!config.enabled && llmForm.apiBase.trim() && llmForm.apiKey.trim()) {
-        config = await updateLlmConfig({ api_base: llmForm.apiBase.trim(), api_key: llmForm.apiKey.trim(), model: llmForm.model.trim() || "deepseek-v4-flash", enabled: true });
+        config = await updateLlmConfig({ api_base: llmForm.apiBase.trim(), api_key: llmForm.apiKey.trim(), model: llmForm.model.trim() || "deepseek-v4-flash", enabled: true, thinking_enabled: llmForm.thinkingEnabled, max_tokens: llmForm.maxTokens });
       }
       setServerConfig(config);
       setBackendOnline(true);
@@ -324,6 +329,8 @@ export default function SettingsDrawer({
         api_key: llmForm.apiKey.trim(),
         model: llmForm.model.trim() || "deepseek-v4-flash",
         enabled: true,
+        thinking_enabled: llmForm.thinkingEnabled,
+        max_tokens: llmForm.maxTokens,
       });
       setServerConfig(result);
       setLlmForm((previous) => ({ ...previous, apiBase }));
@@ -399,10 +406,6 @@ export default function SettingsDrawer({
           );
         })}
       </div>
-      <Paragraph type="secondary" style={{ fontSize: 12, marginTop: 10, marginBottom: 0 }}>
-        切换后立即生效并记住选择；「明金」为 CubeMind 式亮金按钮风格。
-      </Paragraph>
-
       {/* LLM connection ---------------------------------------------------- */}
       <SectionTitle>大模型接入</SectionTitle>
       <div style={{ marginBottom: 12 }}>
@@ -415,7 +418,7 @@ export default function SettingsDrawer({
         )}
         {serverConfig && backendOnline &&
           (serverConfig.enabled ? (
-            <Tag color="gold">LLM 已启用 · {serverConfig.model}</Tag>
+            <Tag color="green">LLM 已启用 · {serverConfig.model}</Tag>
           ) : (
             <Tag>LLM 未启用（使用模板报告）</Tag>
           ))}
@@ -453,6 +456,25 @@ export default function SettingsDrawer({
           placeholder="deepseek-v4-flash"
         style={{ marginBottom: 12 }}
       />
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+        <div>
+          <FieldLabel>开启推理模式</FieldLabel>
+          <Text type="secondary" style={{ fontSize: 12 }}>更慢、token 消耗更高；关闭时优先快速生成研究正文。</Text>
+        </div>
+        <Switch checked={llmForm.thinkingEnabled} onChange={(thinkingEnabled) => setLlmForm((prev) => ({ ...prev, thinkingEnabled }))} />
+      </div>
+      <FieldLabel>单次输出上限（token）</FieldLabel>
+      <InputNumber
+        value={llmForm.maxTokens}
+        onChange={(maxTokens) => setLlmForm((prev) => ({ ...prev, maxTokens: maxTokens ?? 900 }))}
+        min={128}
+        max={1200}
+        step={100}
+        style={{ width: "100%", marginBottom: 4 }}
+      />
+      <Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 12 }}>
+        单次文本模型调用最多生成的 token 数；系统硬上限为 1200，避免长报告或推理模式消耗失控。
+      </Paragraph>
       <div style={{ display: "flex", gap: 8 }}>
         <Button style={{ flex: 1 }} loading={isSavingLlm} disabled={isTestingLlm} onClick={() => void handleSaveLlm()}>保存并应用</Button>
         <Button style={{ flex: 1 }} loading={isTestingLlm} disabled={isSavingLlm} onClick={() => void handleTestLlm()}>测试连通性</Button>

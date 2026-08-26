@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 # Default timeout for LLM API calls (seconds)
 _LLM_TIMEOUT = 30.0
+_MAX_LLM_OUTPUT_TOKENS = 1200
 
 
 @dataclass
@@ -38,6 +39,8 @@ class ReportConfig:
     api_key: str = ""
     model: str = "deepseek-v4-flash"  # default model name
     enabled: bool = False  # whether LLM mode is active
+    thinking_enabled: bool = False
+    max_tokens: int = 900
 
     @classmethod
     def from_env(cls) -> "ReportConfig":
@@ -50,11 +53,18 @@ class ReportConfig:
         api_base = os.getenv("LLM_API_BASE", "")
         api_key = os.getenv("LLM_API_KEY", "")
         model = os.getenv("LLM_MODEL", "deepseek-v4-flash")
+        thinking_enabled = os.getenv("LLM_THINKING_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            max_tokens = int(os.getenv("LLM_MAX_TOKENS", "900"))
+        except ValueError:
+            max_tokens = 900
         return cls(
             api_base=api_base,
             api_key=api_key,
             model=model,
             enabled=bool(api_base and api_key),
+            thinking_enabled=thinking_enabled,
+            max_tokens=max(128, min(max_tokens, _MAX_LLM_OUTPUT_TOKENS)),
         )
 
 
@@ -68,6 +78,7 @@ class AnalysisReport:
     disclaimer: str = ""
     generated_at: str = ""
     engine: str = "template"  # "template" | "llm:{model_name}"
+    llm_error: str = ""
     method_provenance: dict = field(default_factory=dict)
 
 
@@ -98,6 +109,7 @@ def generate_report(
     charts_data = _build_charts_data(classification, factors, varieties)
 
     # Generate summary text
+    llm_error = ""
     if config.enabled:
         try:
             summary = _generate_llm_summary(
@@ -106,6 +118,7 @@ def generate_report(
             engine = f"llm:{config.model}"
         except Exception as exc:
             logger.warning("LLM report generation failed, falling back to template: %s", exc)
+            llm_error = str(exc)[:200] or type(exc).__name__
             summary = _generate_template_summary(
                 classification, factors, varieties, strategy_hint, external_factor_context, market_reference_context
             )
@@ -138,8 +151,9 @@ def generate_report(
             }
         ),
         "summary": {
-            "method": "LLM" if engine.startswith("llm:") else "本地模板",
+            "method": "LLM" if engine.startswith("llm:") else "模板回退" if llm_error else "本地模板",
             "model": config.model if engine.startswith("llm:") else None,
+            "detail": f"LLM 调用失败：{llm_error}" if llm_error else "",
         },
     }
     structured["method_provenance"] = method_provenance
@@ -151,6 +165,7 @@ def generate_report(
         disclaimer=disclaimer,
         generated_at=datetime.now().isoformat(timespec="seconds"),
         engine=engine,
+        llm_error=llm_error,
         method_provenance=method_provenance,
     )
 
@@ -319,8 +334,10 @@ def _generate_llm_summary(
         "model": config.model,
         "messages": messages,
         "temperature": 0.3,
-        "max_tokens": 800,
+        "max_tokens": min(1600 if config.thinking_enabled else 800, config.max_tokens),
     }
+    if config.model.lower().startswith("deepseek-") and not config.thinking_enabled:
+        payload["thinking"] = {"type": "disabled"}
 
     with httpx.Client(timeout=_LLM_TIMEOUT) as client:
         response = client.post(url, json=payload, headers=headers)

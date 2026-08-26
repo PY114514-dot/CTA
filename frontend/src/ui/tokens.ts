@@ -5,8 +5,8 @@
  * so theme colors must be read from computed style at render time instead.
  */
 
-/** Fallback for the --serif-accent variable (matches the default gold preset). */
-export const ACCENT_FALLBACK = "#B8860B";
+/** Fallback for the --serif-accent variable (matches the professional-blue preset). */
+export const ACCENT_FALLBACK = "#1D4ED8";
 
 /** Read a --serif-* CSS variable at render time (ECharts canvas cannot resolve CSS vars). */
 export function cssVar(name: string, fallback: string): string {

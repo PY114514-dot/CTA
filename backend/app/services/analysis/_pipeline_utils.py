@@ -47,12 +47,30 @@ def compute_periodic_returns(
         Array of length N-1 with simple returns.
     return_dates : list[date]
         Corresponding dates (the later date of each pair).
+
+    Notes
+    -----
+    Points are first sorted by observation date, and any point whose NAV is
+    missing, non-finite or non-positive is dropped.  A single bad cell would
+    otherwise poison two periods with NaN/Inf returns and silently corrupt
+    downstream regressions.
     """
-    nav_values = np.array([p.net_asset_value for p in nav_points], dtype=float)
-    dates = [p.observation_date for p in nav_points]
-    periodic_returns = np.diff(nav_values) / nav_values[:-1]
-    return_dates = dates[1:]
-    return periodic_returns, return_dates
+    ordered = sorted(nav_points, key=lambda p: p.observation_date)
+    values: list[float] = []
+    dates: list[date] = []
+    for point in ordered:
+        try:
+            nav = float(point.net_asset_value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(nav) and nav > 0:
+            values.append(nav)
+            dates.append(point.observation_date)
+    array = np.asarray(values, dtype=float)
+    if len(array) < 2:
+        return np.array([], dtype=float), []
+    periodic_returns = np.diff(array) / array[:-1]
+    return periodic_returns, dates[1:]
 
 
 def align_product_and_market_returns(

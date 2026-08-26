@@ -26,6 +26,7 @@ from app.services.factor_library.short_trend import ShortTermTrendFactor
 from app.services.factor_library.skewness import SkewnessFactor
 from app.services.factor_library.mean_reversion import MeanReversionFactor
 from app.services.factor_library.fundamental import WarehouseReceiptFactor, InventoryFactor
+from app.services.factor_library.nanhua import NanhuaCommodityIndexFactor
 from app.services.factor_library.registry import get_core_symbols, get_sector_coverage
 from app.services.factor_library.data_fetcher import fetch_panels, get_data_summary
 from app.services.factor_library import cache
@@ -51,6 +52,11 @@ def _register(factor: FactorBase) -> None:
     _FACTORS[factor.meta.name] = factor
 
 
+def _annualization_factor(frequency: str) -> int:
+    return {"daily": 252, "weekly": 52, "monthly": 12}.get(frequency, 252)
+
+
+_register(NanhuaCommodityIndexFactor())
 _register(TrendFactor())
 _register(VolumePriceCorrFactor())
 _register(CrossSectionMomentumFactor())
@@ -72,6 +78,7 @@ def get_all_factors() -> list[dict]:
             "category": f.meta.category,
             "description": f.meta.description,
             "params": f.meta.params,
+            "frequency": f.meta.frequency,
             "cached": cache.get_cache_info(f.meta.name) is not None,
         }
         for f in _FACTORS.values()
@@ -107,6 +114,7 @@ def get_factor_detail(name: str) -> dict | None:
         "formula": factor.meta.formula,
         "derivation": factor.meta.derivation,
         "params": factor.meta.params,
+        "frequency": factor.meta.frequency,
         "code": code,
     }
 
@@ -191,24 +199,31 @@ def build_factors(
                 continue
         to_build.append(name)
 
-    # Fetch market data if needed
+    # Fetch daily market data only for factors that use it.  Local benchmark
+    # factors can build even when an external OHLCV provider is unavailable.
     panels = {}
     data_summary = {}
     if to_build:
-        _emit(f"正在获取 {len(get_core_symbols())} 个核心品种行情数据...", 8)
-        panels = fetch_panels(providers, start, end)
-        data_summary = get_data_summary(panels)
+        panel_targets = [name for name in to_build if _FACTORS[name].requires_market_panels()]
+        if panel_targets:
+            _emit(f"正在获取 {len(get_core_symbols())} 个核心品种行情数据...", 8)
+            panels = fetch_panels(providers, start, end)
+            data_summary = get_data_summary(panels)
 
-        if not panels:
-            _emit("未获取到任何行情数据，构建终止（区间可能过短，需覆盖约 300 个交易日以上）", 100)
-            for name in to_build:
+        if panel_targets and not panels:
+            _emit("未获取到日频行情；仅继续构建不依赖行情面板的本地因子", 12)
+            for name in panel_targets:
                 errors[name] = (
                     "No market data: 每个品种需至少 300 个交易日数据，"
                     "请扩大构建区间（建议起始日不晚于 1.5 年前）"
                 )
-            return {"results": results, "data_summary": data_summary, "errors": errors}
+            to_build = [name for name in to_build if name not in panel_targets]
+            if not to_build:
+                _emit("未获取到任何行情数据，构建终止（区间可能过短，需覆盖约 300 个交易日以上）", 100)
+                return {"results": results, "data_summary": data_summary, "errors": errors}
 
-        _emit(f"行情数据就绪: {len(panels)} 个品种可用", 15)
+        if panel_targets and panels:
+            _emit(f"行情数据就绪: {len(panels)} 个品种可用", 15)
 
         # Compute each factor
         n = len(to_build)
@@ -218,7 +233,11 @@ def build_factors(
             try:
                 _emit(f"正在计算因子 '{name}' ({idx + 1}/{n})...", pct_base)
                 logger.info("Computing factor '%s'...", name)
-                factor_ret = factor.compute(panels)
+                factor_ret = factor.compute(panels).sort_index()
+                factor_ret = factor_ret.loc[
+                    (factor_ret.index >= pd.Timestamp(start))
+                    & (factor_ret.index <= pd.Timestamp(end))
+                ]
 
                 if factor_ret.empty or len(factor_ret) < 20:
                     errors[name] = f"Insufficient output ({len(factor_ret)} rows)"
@@ -236,7 +255,11 @@ def build_factors(
                 # these immutable artifacts are the reproducibility record.
                 cache.save_factor_artifact(name, "baseline_return", factor_ret, start, end, metadata={"params": factor.meta.params})
                 for profile in ("vol_target", "drawdown_control"):
-                    overlaid = apply_risk_overlay(factor_ret, profile)
+                    overlaid = apply_risk_overlay(
+                        factor_ret,
+                        profile,
+                        periods_per_year=_annualization_factor(factor.meta.frequency),
+                    )
                     cache.save_factor_artifact(name, "risk_overlay_return", overlaid, start, end, metadata={"profile": profile, "overlay": overlay_metadata(profile)})
                 raw_signal = factor.compute_raw_signal(panels)
                 if raw_signal is not None:
@@ -295,7 +318,9 @@ def get_factor_series(
     rets = cache.load_factor_returns(factor_name, start, end)
     if rets is None:
         return None
-    return apply_risk_overlay(rets, risk_profile)
+    factor = _FACTORS.get(factor_name)
+    frequency = factor.meta.frequency if factor is not None else "daily"
+    return apply_risk_overlay(rets, risk_profile, periods_per_year=_annualization_factor(frequency))
 
 
 def get_factor_nav(
@@ -328,15 +353,20 @@ def compute_factor_performance(risk_profile: str = BASELINE_PROFILE) -> list[dic
     perf: list[dict] = []
     for name, factor in _FACTORS.items():
         baseline_rets = cache.load_factor_returns(name)
-        rets = apply_risk_overlay(baseline_rets, risk_profile) if baseline_rets is not None else None
+        periods_per_year = _annualization_factor(factor.meta.frequency)
+        rets = (
+            apply_risk_overlay(baseline_rets, risk_profile, periods_per_year=periods_per_year)
+            if baseline_rets is not None
+            else None
+        )
         if rets is None or rets.empty or len(rets) < 20:
             continue
 
         rets = rets.astype(float)
         nav = (1 + rets).cumprod()
 
-        ann_ret = float(rets.mean() * 252)
-        ann_vol = float(rets.std(ddof=1) * (252 ** 0.5))
+        ann_ret = float(rets.mean() * periods_per_year)
+        ann_vol = float(rets.std(ddof=1) * (periods_per_year ** 0.5))
         sharpe = ann_ret / ann_vol if ann_vol > 1e-10 else 0.0
 
         drawdown = nav / nav.cummax() - 1.0
@@ -355,6 +385,7 @@ def compute_factor_performance(risk_profile: str = BASELINE_PROFILE) -> list[dic
             "name": name,
             "display_name": factor.meta.display_name,
             "category": factor.meta.category,
+            "frequency": factor.meta.frequency,
             "annualized_return": round(ann_ret, 4),
             "annualized_vol": round(ann_vol, 4),
             "sharpe": round(sharpe, 2),

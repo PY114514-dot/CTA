@@ -30,7 +30,7 @@ start "后端 - FastAPI" cmd /k "cd /d "%~dp0backend" && .venv\Scripts\python.ex
 timeout /t 2 /nobreak >nul
 
 echo [2/2] 启动前端服务 (http://localhost:5275) ...
-start "前端 - Vite" cmd /k "cd /d "%~dp0frontend" && npx vite --host --port 5275"
+start "前端 - Vite" cmd /k "cd /d "%~dp0frontend" && npx vite --host 127.0.0.1 --port 5275"
 
 :: 等待前端就绪后打开浏览器
 timeout /t 3 /nobreak >nul

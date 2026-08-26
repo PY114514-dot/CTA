@@ -50,7 +50,7 @@ def render_markdown_pdf(title: str, markdown: str) -> bytes:
         page.insert_text((_MARGIN_X, y), text, fontsize=size, color=(0.12, 0.23, 0.33), **font_kwargs)
         y += _LINE_HEIGHT
 
-    write_line(title or "产品净值分析报告", 15)
+    write_line(title or "产品分析报告", 15)
     y += 6
     for raw_line in markdown.splitlines():
         if raw_line.startswith("## "):
@@ -68,7 +68,7 @@ def render_markdown_pdf(title: str, markdown: str) -> bytes:
         for part in _wrap(raw_line):
             write_line(part)
 
-    document.set_metadata({"title": title or "产品净值分析报告", "author": "私募 CTA 研究平台"})
+    document.set_metadata({"title": title or "产品分析报告", "author": "私募 CTA 研究平台"})
     result = document.tobytes(garbage=4, deflate=True)
     document.close()
     return result

@@ -212,7 +212,7 @@ def rank_cta_products(request: CtaRankingRequest) -> CtaRankingResponse:
             "data": {
                 "frequency": frequency,
                 "as_of_date": as_of_date.isoformat(),
-                "market_proxy": "provided" if request.market_series else "peer_median_fallback",
+                "market_proxy": "provided" if market_proxy else "not_covered",
                 "market_data_end_date": market_data_end.isoformat() if market_data_end else None,
             },
             "ranking": {
@@ -409,13 +409,8 @@ def _build_market_proxy(
         else:
             return proxy, end_date, warnings
 
-    by_date: dict[date, list[float]] = {}
-    for item in prepared:
-        for day, value in item.return_map.items():
-            by_date.setdefault(day, []).append(value)
-    proxy = {day: float(np.median(values)) for day, values in by_date.items() if values}
-    warnings.append("未提供可用市场代理；趋势和状态层使用产品横截面中位数收益作为临时统计代理。")
-    return proxy, max(proxy) if proxy else None, warnings
+    warnings.append("未提供可用市场代理；趋势、状态和尾部相关指标未覆盖，不使用产品横截面代理。")
+    return {}, None, warnings
 
 
 def _trend_features(
@@ -516,13 +511,15 @@ def _score_primary_dimensions(prepared: list[_PreparedProduct]) -> None:
             item.dimension_metric_scores.setdefault(dimension, {})
             item.dimension_window_scores.setdefault(dimension, {})
             for metric, metric_scores in metric_scores_by_window.items():
-                item.dimension_metric_scores[dimension][metric] = _weighted_available(
+                score = _weighted_available(
                     {
                         window: metric_scores.get(item.product.product_id, {}).get(window)
                         for window in WINDOWS
                     },
                     WINDOW_WEIGHTS,
                 )
+                if score is not None:
+                    item.dimension_metric_scores[dimension][metric] = score
             window_scores: dict[int, float] = {}
             for window in WINDOWS:
                 window_metrics = {
@@ -531,9 +528,13 @@ def _score_primary_dimensions(prepared: list[_PreparedProduct]) -> None:
                     .get(window)
                     for metric in metric_weights
                 }
-                window_scores[window] = _weighted_available(window_metrics, metric_weights)
+                score = _weighted_available(window_metrics, metric_weights)
+                if score is not None:
+                    window_scores[window] = score
             item.dimension_window_scores[dimension] = window_scores
-            item.dimension_raw_scores[dimension] = _weighted_available(window_scores, WINDOW_WEIGHTS)
+            score = _weighted_available(window_scores, WINDOW_WEIGHTS)
+            if score is not None:
+                item.dimension_raw_scores[dimension] = score
 
 
 def _dimension_metric_windows(
@@ -651,8 +652,10 @@ def _score_robustness_dimension(prepared: list[_PreparedProduct]) -> None:
             for metric, score in metric_scores.items()
             if score is not None
         }
-        item.dimension_window_scores[dimension] = {52: _weighted_available(metric_scores, metric_weights)}
-        item.dimension_raw_scores[dimension] = item.dimension_window_scores[dimension][52]
+        score = _weighted_available(metric_scores, metric_weights)
+        if score is not None:
+            item.dimension_window_scores[dimension] = {52: score}
+            item.dimension_raw_scores[dimension] = score
 
 
 def _phase_d_oos_validation_score(
@@ -738,11 +741,13 @@ def _assign_total_scores_and_ranks(eligible: list[_PreparedProduct]) -> None:
     if not eligible:
         return
     for item in eligible:
-        item.total_score = float(sum(
-            float(DIMENSION_DEFINITIONS[dimension]["weight"]) / 100.0
-            * item.dimension_adjusted_scores.get(dimension, 50.0)
-            for dimension in DIMENSION_DEFINITIONS
-        ))
+        available = [
+            (score, float(DIMENSION_DEFINITIONS[dimension]["weight"]))
+            for dimension, score in item.dimension_adjusted_scores.items()
+        ]
+        item.total_score = float(
+            sum(score * weight for score, weight in available) / sum(weight for _, weight in available)
+        ) if available else 0.0
     ordered = sorted(eligible, key=lambda item: (-item.total_score, item.product.product_id))
     for index, item in enumerate(ordered, start=1):
         item.rank = index
@@ -767,8 +772,10 @@ def _to_result(item: _PreparedProduct) -> CtaRankingProductResult:
             dimension=dimension,
             label=str(definition["label"]),
             weight=float(definition["weight"]),
-            raw_score=round(item.dimension_raw_scores.get(dimension, 50.0), 4),
-            adjusted_score=round(item.dimension_adjusted_scores.get(dimension, 50.0), 4),
+            raw_score=round(item.dimension_raw_scores[dimension], 4) if dimension in item.dimension_raw_scores else None,
+            adjusted_score=round(item.dimension_adjusted_scores[dimension], 4) if dimension in item.dimension_adjusted_scores else None,
+            metric_count=len(metric_weights),
+            covered_metric_count=len(metric_scores),
             metric_scores={key: round(value, 4) for key, value in metric_scores.items()},
             metric_values={
                 key: round(value, 8) if value is not None else None
@@ -815,17 +822,17 @@ def _latest_metric_value(item: _PreparedProduct, dimension: str, metric: str) ->
 def _weighted_available(
     values: dict[int | str, float | None],
     weights: dict[int | str, float],
-) -> float:
+) -> float | None:
     available = [
         (float(value), float(weights[key]))
         for key, value in values.items()
         if value is not None and np.isfinite(value) and key in weights
     ]
     if not available:
-        return 50.0
+        return None
     numerator = sum(value * weight for value, weight in available)
     denominator = sum(weight for _, weight in available)
-    return float(numerator / denominator) if denominator else 50.0
+    return float(numerator / denominator) if denominator else None
 
 
 def _cross_sectional_scores(values: dict[str, float]) -> dict[str, float]:
@@ -925,18 +932,20 @@ def _bootstrap_persistence(returns: np.ndarray, product_id: str) -> float:
     seed = int(digest[:8], 16)
     rng = np.random.default_rng(seed)
     block_size = 4
-    successes = 0
     draws = 48
-    for _ in range(draws):
-        sampled: list[float] = []
-        while len(sampled) < returns.size:
-            start = int(rng.integers(0, max(returns.size - block_size + 1, 1)))
-            sampled.extend(returns[start:start + block_size].tolist())
-        sampled_array = np.asarray(sampled[:returns.size], dtype=float)
-        compound = float(np.prod(1.0 + sampled_array))
-        annualized = compound ** (52 / sampled_array.size) - 1.0 if compound > 0 else -1.0
-        if annualized > 0 and float(np.mean(sampled_array)) > 0:
-            successes += 1
+    # 向量化重写，与旧版逐块循环的结果逐位一致：
+    # start 取值范围是 [0, n-4]（high = n - block_size + 1），切片长度恒为 4，
+    # 因此每次抽取恰好消耗 ceil(n/4) 个随机数，且按 draw 顺序消费，
+    # 与旧版 while 循环逐块调用 rng.integers 的顺序完全相同。
+    n = int(returns.size)
+    blocks_per_draw = (n + block_size - 1) // block_size
+    high = max(n - block_size + 1, 1)
+    starts = rng.integers(0, high, size=(draws, blocks_per_draw))
+    indices = (starts[..., None] + np.arange(block_size)).reshape(draws, blocks_per_draw * block_size)[:, :n]
+    sampled = returns[indices]
+    compounds = np.prod(1.0 + sampled, axis=1)
+    annualized = np.where(compounds > 0, compounds ** (52 / n) - 1.0, -1.0)
+    successes = int(np.sum((annualized > 0) & (np.mean(sampled, axis=1) > 0)))
     return float(100.0 * successes / draws)
 
 

@@ -1,8 +1,9 @@
 """P0 API for the versioned FOF product-knowledge foundation."""
 
+from functools import lru_cache
 from typing import Literal
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from app.services.fof_library import FofLibraryStore
@@ -10,7 +11,17 @@ from app.services.fof_material_research import analyze_material
 from app.dependencies import get_report_config
 
 router = APIRouter(tags=["FOF 产品库"])
-_store = FofLibraryStore()
+
+
+@lru_cache(maxsize=1)
+def _get_store() -> FofLibraryStore:
+    """Lazily construct the library store (avoids an import-time side effect
+    that would create directories and open the database during module import)."""
+    return FofLibraryStore()
+
+
+def get_fof_library_store() -> FofLibraryStore:
+    return _get_store()
 
 
 class ProductCreateRequest(BaseModel):
@@ -34,19 +45,21 @@ class FofChatRequest(BaseModel):
 
 
 @router.post("/api/fof-library/products")
-def create_product(request: ProductCreateRequest) -> dict:
-    return _store.create_product(request.name, request.manager_name, request.strategy)
+def create_product(request: ProductCreateRequest, store: FofLibraryStore = Depends(get_fof_library_store)) -> dict:
+    return store.create_product(request.name, request.manager_name, request.strategy)
 
 
 @router.get("/api/fof-library/products")
-def list_products() -> list[dict]:
-    return _store.list_products()
+def list_products(store: FofLibraryStore = Depends(get_fof_library_store)) -> list[dict]:
+    return store.list_products()
 
 
 @router.patch("/api/fof-library/products/{product_id}/review")
-def review_product(product_id: str, request: ProductReviewRequest) -> dict:
+def review_product(
+    product_id: str, request: ProductReviewRequest, store: FofLibraryStore = Depends(get_fof_library_store),
+) -> dict:
     try:
-        return _store.review_product(
+        return store.review_product(
             product_id, request.verification_status, request.research_status, request.reason,
         )
     except ValueError as error:
@@ -59,6 +72,7 @@ async def ingest_materials(
     source_label: str | None = Form(default=None),
     report_date: str | None = Form(default=None),
     parsing_method: str = Form(default="manual_upload"),
+    store: FofLibraryStore = Depends(get_fof_library_store),
 ) -> dict[str, list[dict]]:
     """Register immutable source materials; parsing is a separate future task."""
     accepted_types = {"application/pdf", "image/jpeg", "image/png", "image/webp", "text/csv",
@@ -67,7 +81,7 @@ async def ingest_materials(
     for upload in files:
         if upload.content_type not in accepted_types:
             raise HTTPException(415, f"不支持的文件类型：{upload.content_type or '未知'}")
-        results.append(_store.ingest_material(
+        results.append(store.ingest_material(
             await upload.read(), upload.filename or "material.bin", upload.content_type,
             source_label, report_date, parsing_method,
         ))
@@ -75,27 +89,29 @@ async def ingest_materials(
 
 
 @router.post("/api/fof-library/products/{product_id}/materials")
-def link_material(product_id: str, request: MaterialLinkRequest) -> dict[str, Literal["ok"]]:
-    _store.link_material(product_id, request.material_id)
+def link_material(
+    product_id: str, request: MaterialLinkRequest, store: FofLibraryStore = Depends(get_fof_library_store),
+) -> dict[str, Literal["ok"]]:
+    store.link_material(product_id, request.material_id)
     return {"status": "ok"}
 
 
 @router.get("/api/fof-library/materials")
-def list_materials() -> list[dict]:
-    return _store.list_materials()
+def list_materials(store: FofLibraryStore = Depends(get_fof_library_store)) -> list[dict]:
+    return store.list_materials()
 
 
 @router.post("/api/fof-library/materials/{material_id}/analyze")
-def analyze_single_material(material_id: str) -> dict:
+def analyze_single_material(material_id: str, store: FofLibraryStore = Depends(get_fof_library_store)) -> dict:
     """Create evidence-backed FOF Agent research output from one uploaded image."""
     try:
-        return analyze_material(_store, material_id)
+        return analyze_material(store, material_id)
     except ValueError as error:
         raise HTTPException(400, str(error)) from error
 
 
 @router.post("/api/fof-library/chat")
-def fof_library_chat(request: FofChatRequest) -> dict:
+def fof_library_chat(request: FofChatRequest, store: FofLibraryStore = Depends(get_fof_library_store)) -> dict:
     """FOF workbench conversation grounded in its own product/evidence store."""
     query = request.query.strip()
     config = get_report_config()
@@ -106,13 +122,13 @@ def fof_library_chat(request: FofChatRequest) -> dict:
         )
         return {"content": content, "citations": [], "tool_calls": [{"name": "inspect_agent_configuration", "status": "ok", "duration_ms": 0, "summary": f"默认模型：{config.model or 'deepseek-v4-flash'}"}], "products_referenced": [], "data_context": [], "method_provenance": {"summary": {"method": "本地配置读取", "model": config.model or "deepseek-v4-flash"}}}
 
-    products = _store.list_researchable_products()
+    products = store.list_researchable_products()
     if not products:
         return {"content": "尚无可研究产品。请先关联原始材料、复核净值并确认产品身份。", "citations": [], "tool_calls": [{"name": "search_fof_library", "status": "ok", "duration_ms": 0, "summary": "可研究产品 0 个"}], "products_referenced": [], "data_context": [], "method_provenance": {"summary": {"method": "本地证据检索"}}}
     lines = ["以下为已完成复核、可用于研究的产品："]
     citations: list[dict] = []
     for product in products[:8]:
-        evidence = _store.list_product_evidence(product["product_id"])
+        evidence = store.list_product_evidence(product["product_id"])
         facts = "；".join(f"{item['claim_type']} {item['claim_value']}" for item in evidence[:8]) or "未提取到指标"
         lines.append(f"- **{product['name']}**（{product['manager_name'] or '管理人待确认'}）：{facts}。")
         citations.extend({"file_id": item["material_id"], "filename": None, "page_number": None,

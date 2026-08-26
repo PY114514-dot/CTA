@@ -11,6 +11,8 @@ from app.schemas import (
     NavAnalysisResponse,
     NavImageDigitizationResponse,
     DataFrequency,
+    DigitizationAuditReport,
+    DigitizationAuditRequest,
     OcrRegionResponse,
     PaddleOcrDocumentResponse,
     ProductImageRecognitionResponse,
@@ -22,6 +24,7 @@ from app.schemas import (
 )
 from app.services.nav_metrics import calculate_nav_analysis
 from app.services.nav_image_digitizer import digitize_nav_image
+from app.services.digitization_audit import audit_digitized_nav
 from app.services.multi_product_report import extract_multi_product_report
 from app.services.product_strategy_profile import build_strategy_profile, recognize_product_name
 from app.services.image_ocr import ocr_image_region
@@ -40,6 +43,22 @@ def analyze_nav(request: NavAnalysisRequest) -> NavAnalysisResponse:
         return calculate_nav_analysis(request)
     except (ValueError, ArithmeticError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.post("/api/nav/digitize-audit", response_model=DigitizationAuditReport)
+def audit_nav_digitization(request: DigitizationAuditRequest) -> DigitizationAuditReport:
+    """把数字化候选净值与人工核对基准逐日对齐，给出误差审计报告。
+
+    数字化序列是候选值，基准序列视为真值；判定只用于提示是否可采纳，
+    绝不改写任何净值观测。匹配样本不足时直接判 fail。
+    """
+    report = audit_digitized_nav(
+        request.digitized_points,
+        request.reference_points,
+        relative_tolerance=request.relative_tolerance,
+        min_matched=request.min_matched,
+    )
+    return DigitizationAuditReport.model_validate(report)
 
 
 @router.post("/api/nav/digitize-image", response_model=NavImageDigitizationResponse)

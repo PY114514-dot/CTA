@@ -18,6 +18,20 @@ const STRATEGY_LABELS: Record<string, string> = {
   market_neutral: "市场中性",
 };
 
+export type ProductNameCategory = "股票" | "量化" | "CTA" | "波动率" | "期权";
+
+/** Name-based labels are discovery aids only; they never replace a confirmed strategy. */
+export function productNameCategories(name: string, strategy?: string | null): ProductNameCategory[] {
+  const value = `${name} ${strategy ?? ""}`.toLowerCase();
+  const categories: ProductNameCategory[] = [];
+  if (/股票|股指|沪深|中证|权益|指数增强|红利|a股/.test(value)) categories.push("股票");
+  if (/量化|量选|多因子|中性|alpha|阿尔法/.test(value)) categories.push("量化");
+  if (/cta|期货|商品|趋势|套利|跨期/.test(value)) categories.push("CTA");
+  if (/波动率|volatility|\bvix\b/.test(value)) categories.push("波动率");
+  if (/期权|option/.test(value)) categories.push("期权");
+  return categories;
+}
+
 /** Historical examples are intentionally hidden from the working product pool. */
 export function isDemoProduct(product: KbProduct): boolean {
   const name = product.standard_name.trim().toLowerCase();

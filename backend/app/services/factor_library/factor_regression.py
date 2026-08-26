@@ -14,6 +14,7 @@ Methods:
 """
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
@@ -40,7 +41,8 @@ class FactorBeta:
     std_error: float
     t_stat: float
     p_value: float
-    contribution_pct: float  # beta * mean(factor_ret) / mean(product_ret) * 100
+    contribution_pct: float  # Generic-library display metric; CTA views use mean_return_contribution instead.
+    mean_return_contribution: float  # beta * mean(factor_ret), in the product return frequency.
     significant: bool  # |t| > 2
     factor_group: str = "other"
     ordinary_std_error: float = 0.0
@@ -98,6 +100,7 @@ class RegressionResult:
     bootstrap: dict[str, Any] = field(default_factory=dict)
     factor_groups: dict[str, list[str]] = field(default_factory=dict)
     factor_group_contributions: dict[str, float] = field(default_factory=dict)
+    factor_group_mean_return_contributions: dict[str, float] = field(default_factory=dict)
     factor_risk_contributions: dict[str, float | None] = field(default_factory=dict)
     annualized_alpha_bootstrap_ci_low: float | None = None
     annualized_alpha_bootstrap_ci_high: float | None = None
@@ -106,10 +109,21 @@ class RegressionResult:
     collinearity: dict[str, Any] = field(default_factory=dict)
     out_of_sample: dict[str, Any] = field(default_factory=dict)
 
+    # Trend/choppy regime decomposition and the composite attribution-quality
+    # score.  Both are None when the aligned sample cannot support them (no
+    # trend factor, insufficient observations, or no available components).
+    regime: dict[str, Any] | None = None
+    attribution_quality: dict[str, Any] | None = None
+    mean_product_return: float | None = None
+    mean_factor_explained_return: float | None = None
+
 
 # ---------------------------------------------------------------------------
 # Frequency aggregation
 # ---------------------------------------------------------------------------
+
+_FREQUENCY_ORDER = {"daily": 0, "weekly": 1, "monthly": 2}
+
 
 def _aggregate_returns(returns: pd.Series, frequency: str) -> pd.Series:
     """Aggregate daily returns to weekly or monthly frequency.
@@ -153,30 +167,6 @@ def _default_bootstrap_block_length(frequency: str) -> int:
     return {"daily": 20, "weekly": 12, "monthly": 12}.get(frequency, 12)
 
 
-def _stationary_bootstrap_indices(
-    n_observations: int,
-    block_length: int,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Generate circular stationary-bootstrap indices.
-
-    A new block starts with probability ``1 / block_length``.  Resampling
-    rows (rather than y and X independently) preserves the contemporaneous
-    relationship between the product and its factors.
-    """
-    if n_observations <= 0:
-        return np.array([], dtype=int)
-    probability = 1.0 / max(1, block_length)
-    indices = np.empty(n_observations, dtype=int)
-    indices[0] = int(rng.integers(0, n_observations))
-    for position in range(1, n_observations):
-        if rng.random() < probability:
-            indices[position] = int(rng.integers(0, n_observations))
-        else:
-            indices[position] = (indices[position - 1] + 1) % n_observations
-    return indices
-
-
 def _stationary_bootstrap_parameters(
     y: pd.Series,
     X: pd.DataFrame,
@@ -184,7 +174,16 @@ def _stationary_bootstrap_parameters(
     block_length: int,
     random_seed: int,
 ) -> np.ndarray:
-    """Estimate bootstrap parameter draws using stationary row resampling."""
+    """Estimate bootstrap parameter draws using stationary row resampling.
+
+    批次 13（精度）：原实现逐 rep、逐位置用两层 Python 循环生成索引，
+    200 次重抽样约 1.1s/产品。这里把索引生成全部向量化——块起始位置用
+    np.maximum.accumulate 前向传播，随后 (起始值 + 位置偏移) % n 一次
+    算出 (reps, n) 的索引矩阵；最小二乘仍逐 rep 调用 lstsq，保持与原
+    实现完全相同的 SVD 数值语义。200 次约 0.02s，1000 次约 0.06s。
+    随机流改为批量抽取，同一 seed 下结果确定，但具体数值与旧版本不再
+    逐位一致（测试只约束同 seed 可复现）。
+    """
     if reps <= 0:
         return np.empty((0, X.shape[1] + 1), dtype=float)
 
@@ -192,17 +191,33 @@ def _stationary_bootstrap_parameters(
     y_values = y.to_numpy(dtype=float)
     x_values = X.to_numpy(dtype=float)
     design = np.column_stack([np.ones(len(X)), x_values])
-    draws: list[np.ndarray] = []
+    n = len(y_values)
+    probability = 1.0 / max(1, block_length)
 
-    for _ in range(reps):
-        indices = _stationary_bootstrap_indices(len(y_values), block_length, rng)
+    # 块起始标记 (reps, n)：p=0 恒为块起始，其 start_values 即首索引。
+    new_block = rng.random(size=(reps, n)) < probability
+    new_block[:, 0] = True
+    positions = np.arange(n)
+    # 每个位置所属块的最新起始位置（axis=1 上的 forward-fill）。
+    block_start_pos = np.maximum.accumulate(
+        np.where(new_block, positions, 0), axis=1
+    )
+    start_values = rng.integers(0, n, size=(reps, n))
+    indices = (
+        np.take_along_axis(start_values, block_start_pos, axis=1)
+        + (positions - block_start_pos)
+    ) % n
+
+    draws: list[np.ndarray] = []
+    for rep_indices in indices:
         try:
-            params, _, _, _ = np.linalg.lstsq(design[indices], y_values[indices], rcond=None)
+            params, _, _, _ = np.linalg.lstsq(
+                design[rep_indices], y_values[rep_indices], rcond=None
+            )
         except np.linalg.LinAlgError:
             continue
         if np.isfinite(params).all():
             draws.append(params)
-
     return np.asarray(draws, dtype=float).reshape((-1, design.shape[1]))
 
 
@@ -274,7 +289,7 @@ def _infer_factor_group(name: str, category: str = "") -> str:
         return "trend"
     if name in {"cross_section_mom", "mean_reversion_5d"}:
         return "momentum_reversal"
-    if name == "basis_carry":
+    if name in {"basis_carry", "term_structure_carry"}:
         return "carry"
     if name in {"profit_margin", "warehouse_receipt", "inventory"}:
         return "fundamental"
@@ -380,6 +395,26 @@ def _expanding_walk_forward(
     oos_r2 = 1.0 - residual_error / benchmark_error if benchmark_error > 1e-15 else 0.0
     correlation = float(np.corrcoef(actual, predicted)[0, 1]) if len(actual) > 1 else None
     tracking_error = float(np.std(actual - predicted, ddof=1) * np.sqrt(annualization_factor)) if len(actual) > 1 else 0.0
+    segments: list[dict[str, Any]] = []
+    # Keep chronological order: no random folds and no cherry-picking the
+    # best window. Three equal contiguous pieces are the minimum admission
+    # evidence for a strong attribution conclusion.
+    if len(actual) >= 9:
+        for number, positions in enumerate(np.array_split(np.arange(len(actual)), 3), start=1):
+            segment_actual = actual[positions]
+            segment_predicted = predicted[positions]
+            baseline = np.sum((segment_actual - segment_actual.mean()) ** 2)
+            segment_r2 = 1.0 - np.sum((segment_actual - segment_predicted) ** 2) / baseline if baseline > 1e-15 else None
+            direction = float(np.mean(np.sign(segment_actual) == np.sign(segment_predicted)))
+            dates = y.index[train_window:][positions]
+            segments.append({
+                "segment": number,
+                "test_start_date": dates[0].strftime("%Y-%m-%d"),
+                "test_end_date": dates[-1].strftime("%Y-%m-%d"),
+                "observations": len(positions),
+                "r_squared": round(float(segment_r2), 6) if segment_r2 is not None else None,
+                "directional_accuracy": round(direction, 6),
+            })
     return {
         "method": "expanding_window",
         "train_window": train_window,
@@ -387,7 +422,217 @@ def _expanding_walk_forward(
         "r_squared": round(float(oos_r2), 6),
         "correlation": round(correlation, 6) if correlation is not None else None,
         "tracking_error_annual": round(tracking_error, 6),
+        "segments": segments,
+        "positive_segment_fraction": round(float(np.mean([item["r_squared"] > 0 for item in segments if item["r_squared"] is not None])), 6) if any(item["r_squared"] is not None for item in segments) else None,
         "warnings": [],
+    }
+
+
+def assess_oos_applicability(out_of_sample: dict[str, Any]) -> dict[str, Any]:
+    """Turn OOS diagnostics into one conservative, user-facing conclusion."""
+    r_squared = out_of_sample.get("r_squared")
+    segments = [item for item in out_of_sample.get("segments", []) if item.get("r_squared") is not None]
+    positive_fraction = out_of_sample.get("positive_segment_fraction")
+    if r_squared is None or len(segments) < 3:
+        return {"status": "observe_only", "reason": "样本外测试段不足 3 段，基础模型只供观察。", "segments_passed": len(segments), "segments_required": 3}
+    if r_squared < 0:
+        return {"status": "not_applicable", "reason": "样本外 R² 为负，当前 CTA 因子模型不适用。", "segments_passed": len(segments), "segments_required": 3}
+    if positive_fraction is None or positive_fraction < 2 / 3:
+        return {"status": "not_applicable", "reason": "多数连续样本外测试段未改善基准预测，当前 CTA 因子模型不适用。", "segments_passed": len(segments), "segments_required": 3}
+    return {"status": "applicable", "reason": "样本外整体与多数连续测试段均优于历史均值基准。", "segments_passed": len(segments), "segments_required": 3}
+
+
+# ---------------------------------------------------------------------------
+# Regime decomposition and attribution quality
+# ---------------------------------------------------------------------------
+
+def _trend_regime_column(X: pd.DataFrame) -> str | None:
+    """Pick the factor column that drives the trend/choppy regime split."""
+    for preferred in ("trend", "short_term_trend_20"):
+        if preferred in X.columns:
+            return preferred
+    for col in X.columns:
+        if _infer_factor_group(col) == "trend":
+            return col
+    return None
+
+
+def _regime_trend_indicator(
+    trend_returns: pd.Series,
+    frequency: str,
+) -> tuple[pd.Series, int]:
+    """Build a trending-market dummy from a trend factor's trailing |cumulative return|.
+
+    In trending regimes a trend factor accumulates same-sign returns so its
+    trailing absolute cumulative return is large; in choppy regimes the
+    returns cancel and the value stays small.  A median split turns this
+    into a regime dummy using only trailing-window information.
+    """
+    window = {"daily": 60, "weekly": 13, "monthly": 6}.get(frequency, 60)
+    trailing = trend_returns.rolling(window=window, min_periods=1).sum().abs()
+    valid = trailing.dropna()
+    if valid.empty:
+        return pd.Series(dtype=float), window
+    median = float(valid.median())
+    return (trailing >= median).astype(float), window
+
+
+def _subset_ols_stats(
+    y: pd.Series,
+    X: pd.DataFrame,
+    annualization_factor: int,
+) -> dict[str, Any]:
+    """Compact OLS statistics for one regime subset via numpy lstsq."""
+    design = np.column_stack([np.ones(len(y)), X.to_numpy(dtype=float)])
+    try:
+        params, _, _, _ = np.linalg.lstsq(design, y.to_numpy(dtype=float), rcond=None)
+    except np.linalg.LinAlgError:
+        return {}
+    fitted = design @ params
+    residuals = y.to_numpy(dtype=float) - fitted
+    ss_res = float(np.sum(residuals ** 2))
+    ss_tot = float(np.sum((y.to_numpy(dtype=float) - y.mean()) ** 2))
+    r_squared = 1.0 - ss_res / ss_tot if ss_tot > 1e-15 else 0.0
+    return {
+        "observations": int(len(y)),
+        "r_squared": round(float(np.clip(r_squared, 0.0, 1.0)), 6),
+        "annualized_alpha": round(float(params[0]) * annualization_factor, 6),
+    }
+
+
+def _regime_decomposition(
+    y: pd.Series,
+    X: pd.DataFrame,
+    trend_column: str,
+    frequency: str,
+    min_regime_observations: int = 12,
+) -> dict[str, Any] | None:
+    """Split the aligned sample into trending and choppy regimes.
+
+    Reports subset R² and the R² gain of adding the regime dummy to the full
+    model.  A high trending-regime R² with a low choppy-regime R² is the
+    classic CTA payoff shape (trend models earn in trends, give back in
+    chops) and should be read as a regime story, not a broken model.
+    """
+    indicator, window = _regime_trend_indicator(X[trend_column], frequency)
+    trending_mask = indicator > 0.5
+    choppy_mask = ~trending_mask
+    if int(trending_mask.sum()) < min_regime_observations or int(choppy_mask.sum()) < min_regime_observations:
+        return None
+
+    annualization_factor = {"daily": 252, "weekly": 52, "monthly": 12}.get(frequency, 252)
+    trending_stats = _subset_ols_stats(y[trending_mask], X[trending_mask], annualization_factor)
+    choppy_stats = _subset_ols_stats(y[choppy_mask], X[choppy_mask], annualization_factor)
+    if not trending_stats or not choppy_stats:
+        return None
+
+    base_stats = _subset_ols_stats(y, X, annualization_factor)
+    augmented = X.copy()
+    augmented["__regime_dummy"] = indicator
+    augmented_stats = _subset_ols_stats(y, augmented, annualization_factor)
+    gain = (
+        float(augmented_stats.get("r_squared") or 0.0)
+        - float(base_stats.get("r_squared") or 0.0)
+        if augmented_stats
+        else None
+    )
+
+    return {
+        "method": "trailing_abs_cumulative_return_median_split",
+        "regime_factor": trend_column,
+        "window": window,
+        "trending_share": round(float(trending_mask.mean()), 4),
+        "trending": trending_stats,
+        "choppy": choppy_stats,
+        "augmented": {
+            "r_squared": augmented_stats.get("r_squared"),
+            "r_squared_gain": round(gain, 6) if gain is not None else None,
+        },
+    }
+
+
+def _attribution_quality_score(
+    *,
+    alphas_t_stat: float,
+    annualized_alpha_ci_low: float | None,
+    annualized_alpha_ci_high: float | None,
+    oos_r_squared: float | None,
+    n_significant_factors: int,
+    n_observations: int,
+    frequency: str,
+) -> dict[str, Any] | None:
+    """Aggregate regression diagnostics into one 0-100 attribution-quality score.
+
+    Components are renormalized over whatever evidence is available, so a
+    missing bootstrap interval or an unavailable walk-forward sample degrades
+    gracefully instead of aborting the report.
+    """
+    minimum_observations = {"daily": 252, "weekly": 52, "monthly": 36}.get(frequency, 252)
+
+    # A statistically distinct alpha means the public factor model still
+    # leaves a systematic part of return unexplained.  It must reduce—not
+    # improve—the attribution-quality score.
+    alpha_significance = 100.0 * float(np.clip(1.0 - abs(alphas_t_stat) / 2.0, 0.0, 1.0))
+
+    # Where does zero sit inside the annualized bootstrap interval?  An
+    # interval that includes zero supports the view that the public factor
+    # model has not left a persistent alpha.  An interval excluding zero is
+    # therefore scored 0.
+    if (
+        annualized_alpha_ci_low is not None
+        and annualized_alpha_ci_high is not None
+        and annualized_alpha_ci_high > annualized_alpha_ci_low
+    ):
+        if annualized_alpha_ci_low >= 0.0 or annualized_alpha_ci_high <= 0.0:
+            alpha_bootstrap = 0.0
+        else:
+            position = annualized_alpha_ci_high / (annualized_alpha_ci_high - annualized_alpha_ci_low)
+            alpha_bootstrap = 100.0 * float(np.clip(2.0 * min(position, 1.0 - position), 0.0, 1.0))
+    else:
+        alpha_bootstrap = None
+
+    # An out-of-sample R² of 0.10 or above is strong for CTA products.
+    oos_predictability = (
+        100.0 * float(np.clip(float(oos_r_squared) / 0.10, 0.0, 1.0))
+        if oos_r_squared is not None
+        else None
+    )
+    factor_significance = 100.0 * float(min(1.0, n_significant_factors / 2.0))
+    sample_coverage = 100.0 * float(np.clip(n_observations / minimum_observations, 0.0, 1.0))
+
+    components: dict[str, float | None] = {
+        "alpha_significance": round(alpha_significance, 4),
+        "alpha_bootstrap": round(alpha_bootstrap, 4) if alpha_bootstrap is not None else None,
+        "oos_predictability": round(oos_predictability, 4) if oos_predictability is not None else None,
+        "factor_significance": round(factor_significance, 4),
+        "sample_coverage": round(sample_coverage, 4),
+    }
+    weights = {
+        "alpha_significance": 0.30,
+        "alpha_bootstrap": 0.20,
+        "oos_predictability": 0.20,
+        "factor_significance": 0.15,
+        "sample_coverage": 0.15,
+    }
+    available = {name: weight for name, weight in weights.items() if components[name] is not None}
+    if not available:
+        return None
+    weight_total = sum(available.values())
+    effective = {name: weight / weight_total for name, weight in available.items()}
+    score = sum(float(components[name]) * effective[name] for name in effective)
+    warnings = []
+    if components["alpha_bootstrap"] is None:
+        warnings.append("Bootstrap 置信区间不可用，Alpha 区间位置不纳入归因质量分。")
+    if components["oos_predictability"] is None:
+        warnings.append("样本外走步验证不可用，OOS 可预测性不纳入归因质量分。")
+    band = "high" if score >= 75 else "medium" if score >= 50 else "low"
+    return {
+        "score": round(float(score), 4),
+        "band": band,
+        "components": components,
+        "weights": {name: round(weight, 4) for name, weight in effective.items()},
+        "method": "attribution_quality_v1",
+        "warnings": warnings,
     }
 
 
@@ -400,6 +645,7 @@ def run_factor_regression(
     product_dates: list[date],
     frequency: str = "daily",
     factor_names: list[str] | None = None,
+    factor_series_loader: Callable[[str], pd.Series | None] | None = None,
     rolling_window: int | None = None,
     hac_max_lags: int | None = None,
     bootstrap_reps: int = 1000,
@@ -416,6 +662,8 @@ def run_factor_regression(
     product_dates : corresponding observation dates
     frequency : "daily" | "weekly" | "monthly"
     factor_names : which factors to include (None = all cached)
+    factor_series_loader : optional public factor loader; when supplied, it
+        replaces the legacy factor-library loader for the selected names
     rolling_window : if set, run rolling regression with this many periods
     hac_max_lags : Newey-West lag length; None selects a frequency-based default
     bootstrap_reps : stationary-bootstrap repetitions; zero disables bootstrap
@@ -452,16 +700,28 @@ def run_factor_regression(
     if factor_names is None:
         factor_names = [f["name"] for f in all_factors]
 
-    # Display name lookup
-    display_names = {f["name"]: f["display_name"] for f in all_factors}
+    # Metadata lookup also tells us whether a factor can be aligned to the
+    # product frequency without inventing higher-frequency observations.
+    metadata_by_name = {f["name"]: f for f in all_factors}
+    display_names = {name: metadata["display_name"] for name, metadata in metadata_by_name.items()}
 
     # Load and aggregate each factor
     factor_series: dict[str, pd.Series] = {}
     for name in factor_names:
+        factor_frequency = metadata_by_name.get(name, {}).get("frequency", "daily")
+        if _FREQUENCY_ORDER.get(factor_frequency, 0) > _FREQUENCY_ORDER.get(frequency, 0):
+            warnings.append(
+                f"因子 '{name}' 为 {factor_frequency} 频率，不能用于 {frequency} 归因，已跳过。"
+            )
+            continue
         # Attribution intentionally uses baseline returns.  Risk overlays are
         # strategy-level execution choices and must not alter the economic
         # definition of a factor beta.
-        raw = factor_library.get_factor_series(name, risk_profile="baseline")
+        raw = (
+            factor_series_loader(name)
+            if factor_series_loader is not None
+            else factor_library.get_factor_series(name, risk_profile="baseline")
+        )
         if raw is None or raw.empty:
             warnings.append(f"因子 '{name}' 未构建，跳过。请先调用 /api/factor-library/build")
             continue
@@ -588,8 +848,7 @@ def run_factor_regression(
     factor_betas: list[FactorBeta] = []
     factor_groups: dict[str, list[str]] = {}
     mean_product_ret = y.mean()
-    metadata_by_name = {f["name"]: f for f in all_factors}
-
+    mean_factor_explained_return = 0.0
     for col in X.columns:
         beta_val = model.params[col]
         ordinary_se = float(model.bse[col])
@@ -602,6 +861,7 @@ def run_factor_regression(
             contrib = (beta_val * factor_mean) / mean_product_ret * 100
         else:
             contrib = 0.0
+        mean_factor_explained_return += float(beta_val * factor_mean)
 
         metadata = metadata_by_name.get(col, {})
         factor_group = metadata.get("factor_group") or _infer_factor_group(
@@ -616,6 +876,7 @@ def run_factor_regression(
             t_stat=round(float(t), 4),
             p_value=round(float(p), 6),
             contribution_pct=round(float(contrib), 2),
+            mean_return_contribution=round(float(beta_val * factor_mean), 8),
             significant=abs(t) > 2.0,
             factor_group=factor_group,
             ordinary_std_error=round(ordinary_se, 6),
@@ -665,10 +926,15 @@ def run_factor_regression(
         factor.bootstrap_ci_high = round(high, 6) if high is not None else None
 
     group_contributions: dict[str, float] = {}
+    group_mean_return_contributions: dict[str, float] = {}
     for factor in factor_betas:
         group_contributions[factor.factor_group] = round(
             group_contributions.get(factor.factor_group, 0.0) + factor.contribution_pct,
             2,
+        )
+        group_mean_return_contributions[factor.factor_group] = round(
+            group_mean_return_contributions.get(factor.factor_group, 0.0) + factor.mean_return_contribution,
+            8,
         )
 
     covariance = X.cov().to_numpy(dtype=float)
@@ -683,6 +949,24 @@ def run_factor_regression(
         }
     else:
         factor_risk_contributions = {column: None for column in X.columns}
+
+    # --- Regime decomposition and attribution quality ---
+    regime_column = _trend_regime_column(X)
+    regime: dict[str, Any] | None = None
+    if regime_column is not None:
+        regime = _regime_decomposition(y, X, regime_column, frequency)
+        if regime is None:
+            warnings.append("趋势/震荡期拆分因单侧样本不足 12 期未生成。")
+
+    attribution_quality = _attribution_quality_score(
+        alphas_t_stat=float(robust_tvalues.get("const", model.tvalues.get("const", 0))),
+        annualized_alpha_ci_low=alpha_ci_low * ann_factor if alpha_ci_low is not None else None,
+        annualized_alpha_ci_high=alpha_ci_high * ann_factor if alpha_ci_high is not None else None,
+        oos_r_squared=out_of_sample.get("r_squared"),
+        n_significant_factors=sum(1 for factor in factor_betas if factor.significant),
+        n_observations=int(model.nobs),
+        frequency=frequency,
+    )
 
     result = RegressionResult(
         intercept=round(float(intercept), 8),
@@ -714,6 +998,7 @@ def run_factor_regression(
         },
         factor_groups=factor_groups,
         factor_group_contributions=group_contributions,
+        factor_group_mean_return_contributions=group_mean_return_contributions,
         factor_risk_contributions=factor_risk_contributions,
         annualized_alpha_bootstrap_ci_low=round(alpha_ci_low * ann_factor, 6) if alpha_ci_low is not None else None,
         annualized_alpha_bootstrap_ci_high=round(alpha_ci_high * ann_factor, 6) if alpha_ci_high is not None else None,
@@ -721,6 +1006,10 @@ def run_factor_regression(
         joint_hac=joint_hac,
         collinearity=collinearity,
         out_of_sample=out_of_sample,
+        regime=regime,
+        attribution_quality=attribution_quality,
+        mean_product_return=round(float(mean_product_ret), 8),
+        mean_factor_explained_return=round(float(mean_factor_explained_return), 8),
     )
 
     # --- Rolling regression ---

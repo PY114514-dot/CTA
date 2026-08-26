@@ -22,7 +22,7 @@ class ShortTermTrendFactor(FactorBase):
             "组合整体再加杠杆把年化波动目标控制在 10%(杠杆上限 3 倍)。信号滞后一天应用以避免未来函数。"
         ),
         formula=r"""
-s_t = \operatorname{sign}(R_{20})\quad\Rightarrow\quadw \propto s_{t-1}/\sigma_{20},\;\; \text{VT}(10\%)
+s_t = \operatorname{sign}(R_{20})\quad\Rightarrow\quad w \propto s_{t-1}/\sigma_{20},\;\; \text{VT}(10\%)
 """,
         derivation=(
             "短期时序动量捕捉 20 日级别的价格惯性：近期上涨的品种倾向延续上涨。"

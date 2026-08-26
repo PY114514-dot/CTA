@@ -1,6 +1,7 @@
 /** Investment-committee review panel (P4): approval/veto, memo export, outer-loop tracking. */
 
 import React, { useCallback, useEffect, useState } from "react";
+import ReactECharts from "echarts-for-react";
 import {
   Alert,
   Button,
@@ -11,6 +12,7 @@ import {
   Input,
   List,
   Modal,
+  Popconfirm,
   Space,
   Statistic,
   Tag,
@@ -27,12 +29,15 @@ import {
 } from "@ant-design/icons";
 import {
   kbApproveDecision,
+  kbDeleteAllocationDraft,
   kbExportMemo,
   kbGetDecisionDetail,
+  kbInterpretAllocation,
   kbListDecisions,
   kbReopenDecision,
   kbResolveReviewTask,
   kbRunTracking,
+  kbSubmitAllocationDraft,
   kbVetoDecision,
   type DecisionStatus,
   type KbDecision,
@@ -111,7 +116,7 @@ export default function InvestmentCommittee(): React.JSX.Element {
       title={
         <Space size={8}>
           <AuditOutlined style={{ color: "var(--serif-accent, #1677ff)" }} />
-          <span>投委会</span>
+          <span>配置草案库</span>
           {decisions.length > 0 && <Tag style={{ fontSize: 10 }}>{decisions.length}</Tag>}
         </Space>
       }
@@ -126,7 +131,7 @@ export default function InvestmentCommittee(): React.JSX.Element {
           image={Empty.PRESENTED_IMAGE_SIMPLE}
           description={
             <Text type="secondary" style={{ fontSize: 12 }}>
-              暂无推荐决策。在对话中请求 FOF 配置建议后会生成待审核决策。
+              暂无配置草案。先在对话中保存配置草案，再提交人工确认。
             </Text>
           }
           style={{ marginTop: 48 }}
@@ -139,6 +144,7 @@ export default function InvestmentCommittee(): React.JSX.Element {
             dataSource={decisions}
             renderItem={(d) => {
               const meta = STATUS_META[d.status] ?? STATUS_META.draft;
+              const metrics = d.portfolio_metrics;
               return (
                 <List.Item
                   onClick={() => handleSelect(d.id)}
@@ -159,6 +165,19 @@ export default function InvestmentCommittee(): React.JSX.Element {
                       {d.created_at ? new Date(d.created_at).toLocaleString("zh-CN") : ""}
                       {d.reviewer ? ` · ${d.reviewer}` : ""}
                     </Text>
+                    <Space wrap size={[10, 2]} style={{ display: "flex", marginTop: 5, fontSize: 11 }}>
+                      {typeof d.allocation_count === "number" && <Text type="secondary">{d.allocation_count} 只产品</Text>}
+                      {metrics ? (
+                        <>
+                          <span>年化收益 {pct(metrics.annualized_return)}</span>
+                          <span>年化波动 {pct(metrics.annualized_volatility)}</span>
+                          <span>夏普 {metrics.sharpe_ratio?.toFixed(2) ?? "—"}</span>
+                          <span>最大回撤 {pct(metrics.maximum_drawdown)}</span>
+                        </>
+                      ) : (
+                        <Text type="secondary">尚未形成可计算的组合业绩</Text>
+                      )}
+                    </Space>
                   </div>
                 </List.Item>
               );
@@ -170,6 +189,11 @@ export default function InvestmentCommittee(): React.JSX.Element {
               detail={detail}
               loading={detailLoading}
               onChanged={afterMutation}
+              onDeleted={async () => {
+                setActiveId(null);
+                setDetail(null);
+                await refresh();
+              }}
             />
           )}
         </Space>
@@ -182,10 +206,12 @@ function DecisionDetailCard({
   detail,
   loading,
   onChanged,
+  onDeleted,
 }: {
   detail: KbDecisionDetail;
   loading: boolean;
   onChanged: () => Promise<void>;
+  onDeleted: () => Promise<void>;
 }): React.JSX.Element {
   const [vetoOpen, setVetoOpen] = useState(false);
   const [vetoReason, setVetoReason] = useState("");
@@ -197,6 +223,7 @@ function DecisionDetailCard({
 
   const allocations = detail.content?.allocations ?? [];
   const isPending = detail.status === "pending_review";
+  const portfolio = detail.content?.portfolio;
 
   const handleApprove = async () => {
     setBusy(true);
@@ -206,6 +233,32 @@ function DecisionDetailCard({
       await onChanged();
     } catch (e) {
       message.error(e instanceof Error ? e.message : "审批失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleSubmit = async () => {
+    setBusy(true);
+    try {
+      await kbSubmitAllocationDraft(detail.id);
+      message.success("已提交人工确认；通过后才会计算评分并冻结版本。");
+      await onChanged();
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : "提交人工确认失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    setBusy(true);
+    try {
+      await kbDeleteAllocationDraft(detail.id);
+      message.success("配置草案已删除。");
+      await onDeleted();
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : "删除配置草案失败");
     } finally {
       setBusy(false);
     }
@@ -251,6 +304,19 @@ function DecisionDetailCard({
       setMemoOpen(true);
     } catch (e) {
       message.error(e instanceof Error ? e.message : "导出备忘录失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleInterpret = async () => {
+    setBusy(true);
+    try {
+      await kbInterpretAllocation(detail.id);
+      message.success("已生成配置解读；未改变产品、权重或评分。");
+      await onChanged();
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : "生成配置解读失败");
     } finally {
       setBusy(false);
     }
@@ -308,13 +374,35 @@ function DecisionDetailCard({
             {allocations.map((a) => (
               <Statistic
                 key={a.product_id}
-                title={<span style={{ fontSize: 10 }}>{a.name}</span>}
+                title={<span style={{ fontSize: 10 }}>{a.product_name ?? a.name ?? a.product_id}</span>}
                 value={(a.weight * 100).toFixed(1)}
                 suffix="%"
                 valueStyle={{ fontSize: 14, fontVariantNumeric: "tabular-nums" }}
               />
             ))}
           </div>
+        </div>
+      )}
+
+      {portfolio && (
+        <div style={{ marginBottom: 10 }}>
+          <Text type="secondary" style={{ fontSize: 11 }}>组合历史表现</Text>
+          <Space wrap size={[12, 4]} style={{ display: "flex", marginTop: 4, fontSize: 12 }}>
+            <span>年化收益 {pct(portfolio.metrics.annualized_return)}</span>
+            <span>年化波动 {pct(portfolio.metrics.annualized_volatility)}</span>
+            <span>夏普 {portfolio.metrics.sharpe_ratio?.toFixed(2) ?? "—"}</span>
+            <span>最大回撤 {pct(portfolio.metrics.maximum_drawdown)}</span>
+          </Space>
+          <ReactECharts
+            option={{
+              grid: { left: 42, right: 16, top: 14, bottom: 26 },
+              tooltip: { trigger: "axis", valueFormatter: (value: number) => Number(value).toFixed(3) },
+              xAxis: { type: "category", data: portfolio.nav.map((point) => point.date), axisLabel: { fontSize: 10, hideOverlap: true } },
+              yAxis: { type: "value", scale: true, axisLabel: { formatter: (value: number) => value.toFixed(2) } },
+              series: [{ type: "line", data: portfolio.nav.map((point) => point.nav), showSymbol: false, lineStyle: { color: "#2563EB", width: 2 }, areaStyle: { color: "rgba(37, 99, 235, 0.08)" } }],
+            }}
+            style={{ height: 200, marginTop: 6 }}
+          />
         </div>
       )}
 
@@ -349,13 +437,28 @@ function DecisionDetailCard({
       {detail.content?.ic_comment && (
         <Alert type="success" showIcon message="审核意见" description={detail.content.ic_comment} style={{ marginBottom: 10 }} />
       )}
+      {detail.content?.llm_interpretation && (
+        <Alert type="info" showIcon message="配置解读" description={detail.content.llm_interpretation} style={{ marginBottom: 10 }} />
+      )}
+      {detail.content?.deterministic_score && (
+        <Descriptions size="small" column={2} style={{ marginBottom: 10 }} title="配置评分">
+          <Descriptions.Item label="总分">{detail.content.deterministic_score.total}</Descriptions.Item>
+          {Object.entries(detail.content.deterministic_score.components ?? {}).map(([name, value]) => <Descriptions.Item key={name} label={name}>{String(value)}</Descriptions.Item>)}
+        </Descriptions>
+      )}
 
       {/* IC actions */}
       <Space wrap size={6} style={{ marginBottom: 10 }}>
+        {(detail.status === "draft" || detail.status === "vetoed") && (
+          <Popconfirm title="删除配置草案？" description="删除后无法恢复。" okText="删除" cancelText="取消" okButtonProps={{ danger: true, loading: busy }} onConfirm={() => void handleDelete()}>
+            <Button size="small" danger loading={busy}>删除草案</Button>
+          </Popconfirm>
+        )}
+        {detail.status === "draft" && <Button size="small" type="primary" onClick={() => void handleSubmit()} loading={busy}>提交人工确认</Button>}
         {isPending && (
           <>
             <Button size="small" icon={<CheckOutlined />} onClick={() => void handleApprove()} loading={busy}>
-              通过
+              确认通过
             </Button>
             <Button size="small" danger icon={<CloseOutlined />} onClick={() => setVetoOpen(true)} loading={busy}>
               否决
@@ -370,9 +473,10 @@ function DecisionDetailCard({
         <Button size="small" icon={<FileTextOutlined />} onClick={() => void handleMemo()} loading={busy}>
           研究备忘录
         </Button>
-        <Button size="small" icon={<LineChartOutlined />} onClick={() => void handleTrack()} loading={busy}>
+        <Button size="small" onClick={() => void handleInterpret()} loading={busy}>生成配置解读</Button>
+        {detail.status === "approved" && <Button size="small" icon={<LineChartOutlined />} onClick={() => void handleTrack()} loading={busy}>
           推荐后追踪
-        </Button>
+        </Button>}
       </Space>
 
       {/* Tracking history */}

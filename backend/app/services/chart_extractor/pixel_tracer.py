@@ -409,12 +409,7 @@ class TraceConfig:
     vertical_merge_px: int = 3  # merge Y values within this distance in a column
     min_points: int = 5  # minimum traced points to consider a curve valid
     dilate_px: int = 1  # dilate mask to connect anti-aliased pixels
-    max_slope_px: int = 15  # max Y-pixel movement per column (continuity constraint)
-    # Legend swatches commonly share the product-line colour and sit just
-    # below the X axis.  They must not become a new curve segment after a
-    # brief gap in the real trace.
-    legend_bottom_zone_ratio: float = 0.75
-    legend_max_width_ratio: float = 0.30
+    max_slope_px: int = 25  # max Y-pixel movement per column (continuity constraint)
 
 
 def trace_curve(
@@ -456,7 +451,6 @@ def trace_curve(
     region_mask = np.zeros_like(mask)
     region_mask[plot_area.top:plot_area.bottom, plot_area.left:plot_area.right] = 255
     mask = mask & region_mask
-    mask = _suppress_bottom_legend_components(mask, plot_area, config)
 
     # Keep competing trajectories until the whole image has been scanned.
     # Choosing a single cluster in the first column is brittle: a same-colour
@@ -471,7 +465,11 @@ def trace_curve(
         clusters = _cluster_values(ys, config.vertical_merge_px)
         next_frontier = []
         for y_center in clusters:
-            predecessors = [node for node in frontier if config.max_slope_px <= 0 or abs(node[1] - y_center) <= config.max_slope_px]
+            predecessors = [
+                node for node in frontier
+                if config.max_slope_px <= 0
+                or abs(node[1] - y_center) <= config.max_slope_px * max(1, x - node[0])
+            ]
             predecessor = max(
                 predecessors,
                 key=lambda node: (node[2], -(node[3] + abs(node[1] - y_center) ** 2)),
@@ -508,47 +506,6 @@ def trace_curve(
         points.append(TracedPoint(x_px=x, y_px=int(round(y_subpixel))))
 
     return points
-
-
-def _suppress_bottom_legend_components(
-    mask: np.ndarray,
-    plot_area: PlotArea,
-    config: TraceConfig,
-) -> np.ndarray:
-    """Remove short same-colour components in the plot area's bottom band.
-
-    A plotted NAV curve normally spans a meaningful part of the X dimension.
-    Legend swatches are short, sit below the X axis, and often use the exact
-    same red/blue line colour.  Filtering only that geometric combination is
-    deliberately narrower than a global component-size threshold so dashed
-    and partially occluded data curves remain traceable.
-    """
-    roi = mask[plot_area.top:plot_area.bottom, plot_area.left:plot_area.right]
-    if roi.size == 0:
-        return mask
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(roi, connectivity=8)
-    if count <= 1:
-        return mask
-
-    height, width = roi.shape
-    bottom_start = height * config.legend_bottom_zone_ratio
-    max_width = width * config.legend_max_width_ratio
-    remove = np.zeros_like(roi, dtype=bool)
-    removed = 0
-    for label in range(1, count):
-        x, y, component_width, component_height, _ = stats[label]
-        # A component may cross the zone boundary while still being a real
-        # curve; only remove components wholly contained in the bottom band.
-        if y >= bottom_start and component_width <= max_width:
-            remove |= labels == label
-            removed += 1
-    if removed:
-        logger.debug("Excluded %d short bottom-band colour components as legends", removed)
-        roi = roi.copy()
-        roi[remove] = 0
-        mask = mask.copy()
-        mask[plot_area.top:plot_area.bottom, plot_area.left:plot_area.right] = roi
-    return mask
 
 
 def _cluster_values(values: np.ndarray, max_gap: int) -> list[float]:
@@ -952,8 +909,11 @@ def trace_all_curves(
         if x_anchors and x_labels:
             points = calibrate_x_dates(points, x_anchors, x_labels, plot_area)
 
-        # Post-processing: deduplicate dates, remove outlier jumps
-        points = sanitize_nav_points(points)
+        # Raw pixels are useful evidence in the calibration preview.  They
+        # have neither dates nor values yet, so sanitising them here would
+        # erase a valid trace before the user can calibrate it.
+        if y_anchors or (x_anchors and x_labels):
+            points = sanitize_nav_points(points)
 
         results.append(TracedCurve(
             name=name,
@@ -1051,6 +1011,12 @@ def sanitize_nav_points(
 
     # Sort by date
     deduped.sort(key=lambda p: p.date or "")
+
+    # Cumulative-return charts legitimately start close to zero.  Applying a
+    # percentage jump rule there mistakes ordinary basis-point moves for NAV
+    # outliers; callers convert these review candidates to NAV afterwards.
+    if deduped and max(float(point.value or 0.0) for point in deduped) < 0.5:
+        return deduped
 
     # Remove outlier jumps
     if len(deduped) < 3:

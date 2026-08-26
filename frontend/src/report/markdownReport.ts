@@ -3,8 +3,7 @@
  *
  * Extracted from main.tsx for testability and reuse.
  */
-import type { ProductStrategyProfileResponse, ReportGenerateResponse } from "../api";
-import { parseNavText } from "../parser/navParser";
+import type { CtaAttributionSnapshotResponse, ProductStrategyProfileResponse, ReportGenerateResponse } from "../api";
 import type { HistoryRecord } from "../storage/historyStorage";
 
 /** Human labels for AI-classified strategy types (mirrors AnalysisPanel). */
@@ -171,14 +170,53 @@ export function appendAiAnalysisSection(lines: string[], ai: ReportGenerateRespo
   if (ai.disclaimer) lines.push(ai.disclaimer, "");
 }
 
+/** Append a frozen, computed CTA evidence package without invoking an LLM. */
+export function appendCtaAttributionEvidenceSection(
+  lines: string[],
+  snapshot: CtaAttributionSnapshotResponse | undefined,
+): void {
+  if (!snapshot?.evidence_package?.data_lineage) return;
+  const evidence = snapshot.evidence_package;
+  const lineage = evidence.data_lineage;
+  lines.push("### CTA 归因证据包（冻结快照）", "");
+  lines.push(
+    `**快照：** ${snapshot.snapshot_id} · ${snapshot.model_version}`,
+    `**净值版本：** ${snapshot.nav_fingerprint} · 因子版本：${snapshot.factor_data_version}`,
+    `**样本：** ${lineage.date_range.start} 至 ${lineage.date_range.end}，已审核净值 ${lineage.reviewed_observation_count} 条；其中 ${lineage.source_linked_observation_count} 条有关联来源，${lineage.source_unlinked_observation_count} 条暂缺来源关联。`,
+    "",
+  );
+  for (const item of evidence.claims) {
+    lines.push(`**结论（可信度：${item.confidence === "medium" ? "中" : "低"}）：** ${item.claim}`, "");
+    lines.push(`- 支持证据：${item.supporting_evidence.join("；")}`);
+    lines.push(`- 局限/反证：${item.counter_evidence.join("；")}`, "");
+  }
+  if (lineage.source_files.length) {
+    lines.push("**来源文件：**", "");
+    for (const file of lineage.source_files) lines.push(`- ${file.filename}（版本 ${file.version}，哈希 ${file.file_hash}）`);
+    lines.push("");
+  }
+  lines.push("**模型边界：** 本节只记录确定性计算及其来源。LLM 如参与，只能解释此证据包，不能改写净值、将统计暴露表述为真实持仓，或据此生成投资建议。", "");
+}
+
+/** Exportable standalone report for a frozen CTA attribution snapshot. */
+export function generateCtaAttributionEvidenceMarkdown(snapshot: CtaAttributionSnapshotResponse): string {
+  const lines = [
+    `## ${snapshot.product_name} — CTA 归因证据报告`,
+    "",
+    `**冻结时间：** ${snapshot.created_at ?? "—"}`,
+  ];
+  appendCtaAttributionEvidenceSection(lines, snapshot);
+  lines.push("---", "*本报告仅供内部研究复核，不构成投资建议。*", "");
+  return lines.join("\n");
+}
+
 /** Generate a Markdown report from a history record. */
-export function generateMarkdownReport(record: HistoryRecord): string {
+export function generateMarkdownReport(record: HistoryRecord, attributionSnapshot?: CtaAttributionSnapshotResponse): string {
   const lines: string[] = [
-    `## ${record.product_name || "未命名产品"} — 净值分析报告`,
+    `## ${record.product_name || "未命名产品"} — 产品分析报告`,
     "",
     `**生成时间：** ${record.saved_at}`,
     `**数据频率：** ${record.frequency === "daily" ? "日频" : record.frequency === "weekly" ? "周频" : "月频"}`,
-    `**净值点数：** ${record.nav_count}`,
     "",
     "### 业绩指标",
     "",
@@ -195,17 +233,7 @@ export function generateMarkdownReport(record: HistoryRecord): string {
 
   appendStrategyProfileSection(lines, record.strategy_profile);
   appendAiAnalysisSection(lines, record.ai_report);
-
-  lines.push("### 净值数据", "", "| 日期 | 单位净值 |", "| --- | --- |");
-
-  try {
-    const points = parseNavText(record.nav_text);
-    for (const p of points) {
-      lines.push(`| ${p.observation_date} | ${p.net_asset_value.toFixed(6)} |`);
-    }
-  } catch {
-    lines.push("| （数据解析失败） | — |");
-  }
+  appendCtaAttributionEvidenceSection(lines, attributionSnapshot);
 
   lines.push("", "---", "*本报告由私募 CTA 研究平台自动生成，仅供内部研究参考。*", "");
   return lines.join("\n");

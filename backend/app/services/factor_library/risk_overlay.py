@@ -51,7 +51,7 @@ def overlay_metadata(profile: str) -> dict:
         return {
             "profile": profile,
             "display_name": "波动率目标",
-            "description": "以前一日可得的 60 日波动率缩放仓位，目标年化波动 10%，杠杆上限 2 倍。",
+            "description": "以前一日可得的 60 期波动率缩放仓位，目标年化波动 10%，杠杆上限 2 倍。",
             "params": {"target_vol": DEFAULT_CONFIG.target_vol, "vol_lookback": DEFAULT_CONFIG.vol_lookback,
                        "max_leverage": DEFAULT_CONFIG.max_leverage},
         }
@@ -72,6 +72,8 @@ def apply_risk_overlay(
     baseline_returns: pd.Series,
     profile: str = BASELINE_PROFILE,
     config: RiskOverlayConfig = DEFAULT_CONFIG,
+    *,
+    periods_per_year: int = 252,
 ) -> pd.Series:
     """Apply an ex-ante risk overlay without introducing look-ahead bias.
 
@@ -81,12 +83,14 @@ def apply_risk_overlay(
     """
     if profile not in SUPPORTED_PROFILES:
         raise ValueError(f"Unsupported risk profile: {profile}")
+    if periods_per_year <= 0:
+        raise ValueError("periods_per_year must be positive")
     returns = baseline_returns.astype(float).replace([np.inf, -np.inf], np.nan).dropna()
     if returns.empty or profile == BASELINE_PROFILE:
         return returns.rename(baseline_returns.name)
 
     trailing_vol = returns.rolling(config.vol_lookback, min_periods=config.vol_lookback).std(ddof=1)
-    leverage = (config.target_vol / (trailing_vol * np.sqrt(252))).shift(1)
+    leverage = (config.target_vol / (trailing_vol * np.sqrt(periods_per_year))).shift(1)
     leverage = leverage.clip(lower=0.0, upper=config.max_leverage).fillna(0.0)
 
     if profile == DRAWDOWN_CONTROL_PROFILE:

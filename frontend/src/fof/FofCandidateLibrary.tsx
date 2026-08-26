@@ -27,7 +27,7 @@ export default function FofCandidateLibrary({ refreshKey }: { refreshKey: number
         {products.map((product) => <div key={product.product_id} style={{ padding: "7px 8px", border: "1px solid var(--serif-border)", borderRadius: 6 }}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 5 }}>
             <Text strong ellipsis style={{ fontSize: 12, maxWidth: 170 }}>{product.name}</Text>
-            <Tag color="processing" style={{ margin: 0, fontSize: 10 }}>待复核</Tag>
+            <Tag color={product.verification_status === "verified" ? "success" : product.verification_status === "rejected" ? "error" : "processing"} style={{ margin: 0, fontSize: 10 }}>{product.verification_status === "verified" ? "已确认" : product.verification_status === "rejected" ? "已拒绝" : "待复核"}</Tag>
           </div>
           <Text type="secondary" style={{ display: "block", fontSize: 10, marginTop: 3 }}>{product.manager_name ?? "管理人待确认"}</Text>
           <Text type="secondary" style={{ display: "block", fontSize: 10 }}>证据 {product.evidence_count} 条 · 素材 {product.material_count} 份</Text>

@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from app.models import NavObservation, ProductEntity, ReviewStatus
 from app.schemas import DataFrequency, NavAnalysisRequest, NetAssetValuePoint
 from app.services.nav_metrics import calculate_nav_analysis
+from app.services import product_store as store
 
 
 # ---------------------------------------------------------------------------
@@ -125,15 +126,22 @@ def compare_products(
     product_ids: list[str],
     *,
     risk_free_rate: float = 0.015,
+    include_correlations: bool = True,
 ) -> ComparisonResult:
     """Compute metrics for each product and pairwise return correlation."""
     products: list[ProductMetrics] = []
     returns_map: dict[str, np.ndarray] = {}
 
+    entities = {
+        product.id: product.standard_name
+        for product in session.query(ProductEntity).filter(ProductEntity.id.in_(product_ids)).all()
+    }
+    nav_by_product = store.get_nav_series_bulk(session, product_ids, reviewed_only=True)
     for pid in product_ids:
-        entity = session.get(ProductEntity, pid)
-        name = entity.standard_name if entity else pid
-        dates, values = _load_nav_array(session, pid)
+        name = entities.get(pid, pid)
+        observations = nav_by_product.get(pid, [])
+        dates = [observation.observation_date.isoformat() for observation in observations]
+        values = [observation.nav for observation in observations]
 
         if len(values) < 2:
             products.append(ProductMetrics(
@@ -144,17 +152,7 @@ def compare_products(
             ))
             continue
 
-        frequency = "monthly"  # default; could be inferred from dates
-        obs = (
-            session.query(NavObservation)
-            .filter(
-                NavObservation.product_id == pid,
-                NavObservation.review_status == ReviewStatus.REVIEWED,
-            )
-            .first()
-        )
-        if obs and obs.frequency:
-            frequency = obs.frequency
+        frequency = observations[0].frequency or "monthly"
 
         try:
             nav_points = [
@@ -189,6 +187,8 @@ def compare_products(
 
     # Pairwise correlation (on overlapping length).
     correlation: dict[str, dict[str, float]] = {}
+    if not include_correlations:
+        return ComparisonResult(products=products, aligned_window="", correlation_matrix=correlation)
     for pid_a in product_ids:
         correlation[pid_a] = {}
         for pid_b in product_ids:
@@ -242,7 +242,7 @@ def screen_products(
 ) -> list[ScreenResult]:
     """Screen products against explicit rules, returning pass/fail with reasons."""
     rules = rules or ScreenRules()
-    comparison = compare_products(session, product_ids, risk_free_rate=risk_free_rate)
+    comparison = compare_products(session, product_ids, risk_free_rate=risk_free_rate, include_correlations=False)
     results: list[ScreenResult] = []
 
     for pm in comparison.products:
@@ -305,6 +305,7 @@ def optimize_allocation(
     product_ids: list[str],
     *,
     max_single_weight: float = 0.35,
+    max_products: int | None = None,
     risk_free_rate: float = 0.015,
     screen_rules: ScreenRules | None = None,
 ) -> RecommendationResult:
@@ -329,12 +330,13 @@ def optimize_allocation(
         scored.append((s, round(total, 2)))
 
     scored.sort(key=lambda x: x[1], reverse=True)
+    selected = scored[:max_products] if max_products is not None else scored
 
     # Inverse-volatility allocation with score tilt.
     allocations: list[AllocationItem] = []
-    if scored:
+    if selected:
         raw_weights: dict[str, float] = {}
-        for s, score in scored:
+        for s, score in selected:
             m = s.metrics
             assert m is not None
             vol = max(m.annualized_volatility, 0.03)
@@ -346,8 +348,8 @@ def optimize_allocation(
         # Cap and redistribute.
         weights = _cap_weights(weights, max_single_weight)
 
-        score_map = {s.product_id: score for s, score in scored}
-        name_map = {s.product_id: s.product_name for s, _ in scored}
+        score_map = {s.product_id: score for s, score in selected}
+        name_map = {s.product_id: s.product_name for s, _ in selected}
         for pid, weight in sorted(weights.items(), key=lambda x: x[1], reverse=True):
             allocations.append(AllocationItem(
                 product_id=pid,
@@ -386,7 +388,7 @@ def optimize_allocation(
 
     # Expected-performance baseline (frozen for post-recommendation tracking).
     expected_metrics: dict[str, dict[str, float | None]] = {}
-    for s, _score in scored:
+    for s, _score in selected:
         m = s.metrics
         if m is None:
             continue
@@ -407,6 +409,7 @@ def optimize_allocation(
             "confirmed_only": rules.confirmed_only,
         },
         "max_single_weight": max_single_weight,
+        "max_products": max_products,
         "risk_free_rate": risk_free_rate,
         "scores": {a.product_id: a.score for a in allocations},
         "expected_metrics": expected_metrics,
@@ -417,7 +420,7 @@ def optimize_allocation(
         excluded=excluded,
         total_candidates=len(product_ids),
         passed_candidates=len(passed),
-        constraints={"max_single_weight": max_single_weight, "risk_free_rate": risk_free_rate},
+        constraints={"max_single_weight": max_single_weight, "max_products": max_products, "risk_free_rate": risk_free_rate},
         risk_warnings=risk_warnings,
         due_diligence_gaps=dd_gaps,
         data_snapshot=snapshot,

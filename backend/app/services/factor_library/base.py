@@ -59,6 +59,7 @@ class FactorMeta:
     signal_rule: str = ""   # plain-language "when does it trade"
     formula: str = ""       # LaTeX math (rendered by KaTeX on the frontend)
     derivation: str = ""    # economic rationale / derivation prose
+    frequency: str = "daily"  # "daily" | "weekly" | "monthly"
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +73,7 @@ class FactorBase(ABC):
 
     @abstractmethod
     def compute(self, panels: dict[str, pd.DataFrame]) -> pd.Series:
-        """Compute daily factor returns from a panel of variety OHLCV data.
+        """Compute factor returns from a panel of variety OHLCV data.
 
         Parameters
         ----------
@@ -84,8 +85,8 @@ class FactorBase(ABC):
         Returns
         -------
         pd.Series
-            Daily factor returns indexed by date (datetime), name = factor name.
-            The series starts after the lookback warm-up period.
+            Factor returns indexed by date (datetime), named after the factor.
+            Most factors are daily; see ``meta.frequency`` for exceptions.
         """
 
     def compute_nav(self, panels: dict[str, pd.DataFrame]) -> pd.Series:
@@ -94,6 +95,10 @@ class FactorBase(ABC):
         nav = (1 + rets).cumprod()
         nav.name = f"{self.meta.name}_nav"
         return nav
+
+    def requires_market_panels(self) -> bool:
+        """Whether this factor needs the daily futures OHLCV panels to build."""
+        return True
 
     def input_note(self) -> str | None:
         """Return a note when the factor cannot run due to missing external input.

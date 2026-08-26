@@ -42,6 +42,20 @@ export default defineConfig({
     exclude: ["katex"],
   },
   build: {
-    chunkSizeWarningLimit: 3000,
+    chunkSizeWarningLimit: 600,
+    rollupOptions: {
+      output: {
+        // Vite 8 (rolldown) only supports the function form of manualChunks;
+        // the legacy object form throws "manualChunks is not a function".
+        manualChunks(id: string): string | undefined {
+          if (!id.includes("node_modules")) return undefined;
+          if (/[\\/]node_modules[\\/](?:react|react-dom|scheduler)[\\/]/.test(id)) return "vendor-react";
+          if (/[\\/]node_modules[\\/](?:antd|@ant-design|rc-[\w-]+)[\\/]/.test(id)) return "vendor-antd";
+          if (/[\\/]node_modules[\\/](?:echarts|echarts-for-react|zrender)[\\/]/.test(id)) return "vendor-echarts";
+          if (/[\\/]node_modules[\\/](?:katex|react-katex)[\\/]/.test(id)) return "vendor-katex";
+          return undefined;
+        },
+      },
+    },
   },
 });

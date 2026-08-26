@@ -21,6 +21,9 @@ class AllocationIntent:
     strategy_keywords: tuple[str, ...] = ()
     drawdown_preference: bool = False
     max_single_weight: float = 0.35
+    max_products: int | None = None
+    min_annualized_return: float | None = None
+    max_annualized_volatility: float | None = None
 
 
 def is_demo_product(product: ProductEntity) -> bool:
@@ -43,9 +46,21 @@ def is_screening_candidate(product: ProductEntity) -> bool:
     )
 
 
-def parse_allocation_intent(query: str) -> AllocationIntent:
+def parse_allocation_intent(query: str, interpreted: dict[str, object] | None = None) -> AllocationIntent:
     """Extract only unambiguous allocation constraints from plain Chinese."""
     normalized = query.lower()
+
+    def chinese_percent(match: re.Match[str]) -> str:
+        digits = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+        token = match.group(1)
+        if "十" in token:
+            before, after = token.split("十", 1)
+            value = (digits[before] if before else 1) * 10 + (digits[after] if after else 0)
+        else:
+            value = digits.get(token, 0)
+        return f"{value}%"
+
+    normalized = re.sub(r"百分之([零一二两三四五六七八九十]+)", chinese_percent, normalized)
     max_drawdown: float | None = None
     drawdown_preference = "回撤" in normalized or "drawdown" in normalized
     match = re.search(r"(?:回撤|drawdown)[^0-9]{0,16}(\d{1,2}(?:\.\d+)?)\s*%", normalized)
@@ -60,12 +75,47 @@ def parse_allocation_intent(query: str) -> AllocationIntent:
     elif "cta" in normalized:
         strategy_keywords = ("cta",)
 
+    interpreted = interpreted or {}
+
+    def percentage(name: str) -> float | None:
+        value = interpreted.get(name)
+        if isinstance(value, (int, float)) and 0 < float(value) <= 1:
+            return float(value)
+        return None
+
+    def positive_count(name: str) -> int | None:
+        value = interpreted.get(name)
+        if isinstance(value, int) and 1 <= value <= 30:
+            return value
+        return None
+
+    # The optional semantic interpretation is authoritative when available.
+    # The local parser is only a safe fallback for simple explicit percentages.
+    max_drawdown = percentage("max_drawdown") or max_drawdown
+    min_annualized_return = percentage("min_annualized_return")
+    max_annualized_volatility = percentage("max_annualized_volatility")
+    max_products = positive_count("max_products")
+    if min_annualized_return is None:
+        match = re.search(r"(?:年化(?:收益)?|收益)[^0-9]{0,16}(\d{1,2}(?:\.\d+)?)\s*%", normalized)
+        if match:
+            min_annualized_return = float(match.group(1)) / 100
+    if max_annualized_volatility is None:
+        match = re.search(r"(?:年化)?波动[^0-9]{0,16}(\d{1,2}(?:\.\d+)?)\s*%", normalized)
+        if match:
+            max_annualized_volatility = float(match.group(1)) / 100
+    if max_products is None:
+        match = re.search(r"(?:最多|不超过|至多|最好不超过|尽量不超过)\s*(\d+)\s*(?:只|个|款)?", normalized)
+        if match and 1 <= int(match.group(1)) <= 30:
+            max_products = int(match.group(1))
     max_single_weight = 0.30 if max_drawdown is not None and max_drawdown <= 0.10 else 0.35
     return AllocationIntent(
         max_drawdown=max_drawdown,
         strategy_keywords=strategy_keywords,
         drawdown_preference=drawdown_preference,
         max_single_weight=max_single_weight,
+        max_products=max_products,
+        min_annualized_return=min_annualized_return,
+        max_annualized_volatility=max_annualized_volatility,
     )
 
 

@@ -9,11 +9,11 @@ from typing import Any
 
 import numpy as np
 
-from app.services.factor_library import cache
+from app.services.cta_factor_bundle import get_cta_factor_bundle
 
 
 MODEL_VERSIONS = {
-    "phase-a": "cta-attribution-phase-a-v1.1",
+    "phase-a": "cta-attribution-phase-a-v1.2",
     "phase-b": "cta-attribution-phase-b-v1.1",
     "phase-c": "cta-attribution-phase-c-v1.1",
     "phase-d": "cta-attribution-phase-d-v1.0",
@@ -58,28 +58,25 @@ def nav_fingerprint(product_id: str, observations: list[Any]) -> str:
     return _digest(payload)
 
 
-def factor_data_provenance(factor_names: list[str] | None = None) -> dict[str, Any]:
-    """Return stable baseline-cache metadata, excluding mutable build timestamps."""
-    manifest = cache.list_cached_factors()
-    names = sorted(set(factor_names or manifest.keys()))
-    factors: list[dict[str, Any]] = []
-    for name in names:
-        entry = manifest.get(name)
-        if entry is None:
-            factors.append({"name": name, "status": "missing"})
-            continue
-        factors.append({
-            "name": name,
-            "status": "cached",
-            "active_return_version": entry.get("active_return_version"),
-            "rows": entry.get("rows"),
-            "start": entry.get("start"),
-            "end": entry.get("end"),
-            "params": entry.get("params", {}),
-            "data_version": entry.get("data_version", {}),
-        })
-    version = _digest({"profile": "baseline", "factors": factors})
-    return {"profile": "baseline", "version": version, "factors": factors}
+def factor_data_provenance(
+    factor_names: list[str] | None = None,
+    *,
+    as_of_date: date | None = None,
+) -> dict[str, Any]:
+    """Return stable factor-bundle metadata at one information cutoff."""
+    bundle = get_cta_factor_bundle(as_of_date=as_of_date)
+    requested = set(factor_names or [])
+    factors = [
+        factor for factor in bundle["factors"]
+        if not requested or factor.get("name") in requested
+    ]
+    version = _digest({"bundle_version": bundle["bundle_version"], "factors": factors, "as_of_date": as_of_date})
+    return {
+        "profile": bundle["bundle_version"],
+        "version": version,
+        "as_of_date": as_of_date.isoformat() if as_of_date else None,
+        "factors": factors,
+    }
 
 
 def factor_names_from_result(phase: str, result: dict[str, Any]) -> list[str]:
@@ -100,12 +97,16 @@ def build_snapshot_content(
     product: Any,
     observations: list[Any],
     result: dict[str, Any],
+    evidence_package: dict[str, Any] | None = None,
 ) -> tuple[str, str, dict[str, Any]]:
     """Build deterministic label fields and the frozen attribution payload."""
     if phase not in MODEL_VERSIONS:
         raise ValueError(f"不支持的 CTA 归因阶段：{phase}")
     nav_version = nav_fingerprint(product.id, observations)
-    factor_provenance = factor_data_provenance(factor_names_from_result(phase, result))
+    factor_provenance = factor_data_provenance(
+        factor_names_from_result(phase, result),
+        as_of_date=observations[-1].observation_date,
+    )
     model_version = MODEL_VERSIONS[phase]
     as_of_date = observations[-1].observation_date.isoformat()
     label = f"cta-attribution:{phase}:{product.id}:{nav_version}:{factor_provenance['version']}"
@@ -126,6 +127,7 @@ def build_snapshot_content(
             "phase_parameters": result.get("regime_rules", {}).get("parameters", {}) if phase == "phase-c" else result.get("kalman_beta", {}).get("parameters", {}) if phase == "phase-b" else result.get("nonlinear_increment", {}).get("parameters", {}) if phase == "phase-d" else {},
         },
         "results": json_safe(result),
+        "evidence_package": json_safe(evidence_package or {}),
         "warnings": json_safe(result.get("warnings", [])),
     }
     return label, model_version, content

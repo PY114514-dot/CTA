@@ -27,9 +27,20 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.types import JSON
 
 from app.database import Base
+
+
+def _json() -> JSON:
+    """Portable JSON column type: plain JSON on SQLite, JSONB on PostgreSQL.
+
+    ADR-0001 phase 2.  The PostgreSQL deployment gains structured
+    queryability via JSONB; SQLite keeps storing JSON as text.  The variant
+    is dialect-scoped, so autogenerate and create_all stay no-ops on SQLite.
+    """
+    return JSON().with_variant(JSONB(), "postgresql")
 
 
 # ---------------------------------------------------------------------------
@@ -141,10 +152,10 @@ class RawFile(Base):
     parsing_status: Mapped[str] = mapped_column(String(20), default=ParsingStatus.PENDING)
     parsing_error: Mapped[str | None] = mapped_column(Text, default=None)
     extraction_audit: Mapped[dict[str, Any] | None] = mapped_column(
-        JSON, default=None, doc="Persisted OCR/VLM/CV provenance for this parse"
+        _json(), default=None, doc="Persisted OCR/VLM/CV provenance for this parse"
     )
     ingestion_context: Mapped[dict[str, Any] | None] = mapped_column(
-        JSON, default=None, doc="Stable manifest/user hints used by every retry stage"
+        _json(), default=None, doc="Stable manifest/user hints used by every retry stage"
     )
     storage_path: Mapped[str | None] = mapped_column(String(1024), default=None, doc="Local or object-store path")
     uploaded_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
@@ -168,9 +179,9 @@ class DocumentFragment(Base):
     file_id: Mapped[str] = mapped_column(ForeignKey("raw_files.id"), index=True)
     fragment_type: Mapped[str] = mapped_column(String(32), doc="text | table | chart | image | nav_curve")
     page_number: Mapped[int | None] = mapped_column(Integer, default=None)
-    bbox: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None, doc="{x, y, w, h} in page coordinates")
+    bbox: Mapped[dict[str, Any] | None] = mapped_column(_json(), default=None, doc="{x, y, w, h} in page coordinates")
     content_text: Mapped[str | None] = mapped_column(Text, default=None)
-    content_data: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None, doc="Structured payload (table cells, curve points)")
+    content_data: Mapped[dict[str, Any] | None] = mapped_column(_json(), default=None, doc="Structured payload (table cells, curve points)")
     ocr_confidence: Mapped[float | None] = mapped_column(Float, default=None)
     product_id: Mapped[str | None] = mapped_column(ForeignKey("product_entities.id"), default=None, index=True)
     extraction_version: Mapped[int] = mapped_column(Integer, default=1)
@@ -195,6 +206,9 @@ class ProductEntity(Base):
     standard_name: Mapped[str] = mapped_column(String(256), index=True)
     manager_name: Mapped[str | None] = mapped_column(String(256), default=None, index=True)
     strategy: Mapped[str | None] = mapped_column(String(128), default=None, index=True)
+    strategy_disclosure: Mapped[dict[str, Any] | None] = mapped_column(
+        _json(), default=None, doc="User-confirmed minimal strategy disclosure for research context"
+    )
     inception_date: Mapped[date | None] = mapped_column(Date, default=None)
     close_date: Mapped[date | None] = mapped_column(Date, default=None)
     nav_frequency: Mapped[str | None] = mapped_column(String(20), default=None, doc="daily | weekly | monthly")
@@ -202,7 +216,7 @@ class ProductEntity(Base):
     confirmation_status: Mapped[str] = mapped_column(String(20), default=ConfirmationStatus.PENDING, index=True)
     confirmed_by: Mapped[str | None] = mapped_column(String(128), default=None)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
-    merged_into_id: Mapped[str | None] = mapped_column(ForeignKey("product_entities.id"), default=None)
+    merged_into_id: Mapped[str | None] = mapped_column(ForeignKey("product_entities.id"), default=None, index=True)
     notes: Mapped[str | None] = mapped_column(Text, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
@@ -223,10 +237,42 @@ class ProductAlias(Base):
     product_id: Mapped[str] = mapped_column(ForeignKey("product_entities.id"), index=True)
     alias: Mapped[str] = mapped_column(String(256), index=True)
     alias_type: Mapped[str] = mapped_column(String(32), default="name", doc="name | code | backup_name")
-    source_file_id: Mapped[str | None] = mapped_column(ForeignKey("raw_files.id"), default=None)
+    source_file_id: Mapped[str | None] = mapped_column(ForeignKey("raw_files.id"), default=None, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     product: Mapped[ProductEntity] = relationship(back_populates="aliases")
+
+
+# ---------------------------------------------------------------------------
+# 3a. CTA-Fama research governance
+# ---------------------------------------------------------------------------
+
+
+class CtaFamaResearchAudit(Base):
+    """One explicit audit for the local CTA-Fama research universe."""
+
+    __tablename__ = "cta_fama_research_audits"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default="default")
+    exit_history_complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    survivorship_audit_passed: Mapped[bool] = mapped_column(Boolean, default=False)
+    backfill_audit_passed: Mapped[bool] = mapped_column(Boolean, default=False)
+    same_source_deduplicated: Mapped[bool] = mapped_column(Boolean, default=False)
+    oos_state_segments: Mapped[int] = mapped_column(Integer, default=0)
+    reviewed_by: Mapped[str | None] = mapped_column(String(128), default=None)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class CtaFamaProductAudit(Base):
+    """Product-specific point-in-time and source-group audit facts."""
+
+    __tablename__ = "cta_fama_product_audits"
+
+    product_id: Mapped[str] = mapped_column(ForeignKey("product_entities.id"), primary_key=True)
+    source_group: Mapped[str | None] = mapped_column(String(120), default=None)
+    point_in_time_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    reviewed_by: Mapped[str | None] = mapped_column(String(128), default=None)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
 # ---------------------------------------------------------------------------
@@ -248,8 +294,8 @@ class NavObservation(Base):
     nav: Mapped[float] = mapped_column(Float, doc="Unit NAV (positive)")
     acc_nav: Mapped[float | None] = mapped_column(Float, default=None, doc="Accumulated NAV")
     frequency: Mapped[str | None] = mapped_column(String(20), default=None)
-    source_file_id: Mapped[str | None] = mapped_column(ForeignKey("raw_files.id"), default=None)
-    source_fragment_id: Mapped[str | None] = mapped_column(ForeignKey("document_fragments.id"), default=None)
+    source_file_id: Mapped[str | None] = mapped_column(ForeignKey("raw_files.id"), default=None, index=True)
+    source_fragment_id: Mapped[str | None] = mapped_column(ForeignKey("document_fragments.id"), default=None, index=True)
     review_status: Mapped[str] = mapped_column(String(20), default=ReviewStatus.PENDING, index=True)
     reviewed_by: Mapped[str | None] = mapped_column(String(128), default=None)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
@@ -273,9 +319,9 @@ class NavCandidateVersion(Base):
     id: Mapped[str] = mapped_column(String(20), primary_key=True, default=_uuid)
     product_id: Mapped[str] = mapped_column(ForeignKey("product_entities.id"), index=True)
     source_file_id: Mapped[str] = mapped_column(ForeignKey("raw_files.id"), index=True)
-    source_fragment_id: Mapped[str | None] = mapped_column(ForeignKey("document_fragments.id"), default=None)
+    source_fragment_id: Mapped[str | None] = mapped_column(ForeignKey("document_fragments.id"), default=None, index=True)
     frequency: Mapped[str | None] = mapped_column(String(20), default=None)
-    points: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
+    points: Mapped[list[dict[str, Any]]] = mapped_column(_json())
     confidence: Mapped[float | None] = mapped_column(Float, default=None)
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
@@ -296,11 +342,11 @@ class StructuredFact(Base):
     product_id: Mapped[str] = mapped_column(ForeignKey("product_entities.id"), index=True)
     field_name: Mapped[str] = mapped_column(String(128), doc="E.g. management_fee, lock_period, aum")
     field_value: Mapped[str] = mapped_column(Text)
-    source_file_id: Mapped[str | None] = mapped_column(ForeignKey("raw_files.id"), default=None)
-    source_fragment_id: Mapped[str | None] = mapped_column(ForeignKey("document_fragments.id"), default=None)
+    source_file_id: Mapped[str | None] = mapped_column(ForeignKey("raw_files.id"), default=None, index=True)
+    source_fragment_id: Mapped[str | None] = mapped_column(ForeignKey("document_fragments.id"), default=None, index=True)
     confidence: Mapped[float | None] = mapped_column(Float, default=None)
     extraction_version: Mapped[int] = mapped_column(Integer, default=1)
-    superseded_by: Mapped[str | None] = mapped_column(ForeignKey("structured_facts.id"), default=None)
+    superseded_by: Mapped[str | None] = mapped_column(ForeignKey("structured_facts.id"), default=None, index=True)
     confirmation_status: Mapped[str] = mapped_column(String(20), default=ConfirmationStatus.PENDING)
     confirmed_by: Mapped[str | None] = mapped_column(String(128), default=None)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
@@ -322,13 +368,13 @@ class AgentRun(Base):
     id: Mapped[str] = mapped_column(String(20), primary_key=True, default=_uuid)
     session_id: Mapped[str | None] = mapped_column(String(128), default=None, index=True)
     user_query: Mapped[str] = mapped_column(Text)
-    plan: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
+    plan: Mapped[dict[str, Any] | None] = mapped_column(_json(), default=None)
     phase: Mapped[str] = mapped_column(String(20), default=RunPhase.PLAN)
-    tools_used: Mapped[list[str] | None] = mapped_column(JSON, default=None)
-    citations: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, default=None, doc="[{file_id, page, fragment_id}]")
-    reflection: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
+    tools_used: Mapped[list[str] | None] = mapped_column(_json(), default=None)
+    citations: Mapped[list[dict[str, Any]] | None] = mapped_column(_json(), default=None, doc="[{file_id, page, fragment_id}]")
+    reflection: Mapped[dict[str, Any] | None] = mapped_column(_json(), default=None)
     answer: Mapped[str | None] = mapped_column(Text, default=None)
-    data_snapshot_id: Mapped[str | None] = mapped_column(ForeignKey("data_snapshots.id"), default=None)
+    data_snapshot_id: Mapped[str | None] = mapped_column(ForeignKey("data_snapshots.id"), default=None, index=True)
     duration_ms: Mapped[float | None] = mapped_column(Float, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
@@ -345,8 +391,8 @@ class ToolInvocation(Base):
     id: Mapped[str] = mapped_column(String(20), primary_key=True, default=_uuid)
     run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.id"), index=True)
     tool_name: Mapped[str] = mapped_column(String(128))
-    input_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
-    output_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
+    input_summary: Mapped[dict[str, Any] | None] = mapped_column(_json(), default=None)
+    output_summary: Mapped[dict[str, Any] | None] = mapped_column(_json(), default=None)
     status: Mapped[str] = mapped_column(String(20), default="ok")
     error_message: Mapped[str | None] = mapped_column(Text, default=None)
     duration_ms: Mapped[float | None] = mapped_column(Float, default=None)
@@ -366,8 +412,10 @@ class DataSnapshot(Base):
     __tablename__ = "data_snapshots"
 
     id: Mapped[str] = mapped_column(String(20), primary_key=True, default=_uuid)
-    label: Mapped[str | None] = mapped_column(String(256), default=None)
-    content: Mapped[dict[str, Any]] = mapped_column(JSON, doc="Frozen input data (NAV series, params, product IDs)")
+    # Indexed because cta_attribution / cta_ranking resolve snapshots by
+    # label-prefix LIKE scans (ADR-0001 phase 2).
+    label: Mapped[str | None] = mapped_column(String(256), default=None, index=True)
+    content: Mapped[dict[str, Any]] = mapped_column(_json(), doc="Frozen input data (NAV series, params, product IDs)")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
@@ -380,13 +428,13 @@ class DecisionRecord(Base):
     run_id: Mapped[str | None] = mapped_column(ForeignKey("agent_runs.id"), default=None, index=True)
     decision_type: Mapped[str] = mapped_column(String(32), default=DecisionType.RECOMMENDATION)
     title: Mapped[str | None] = mapped_column(String(512), default=None)
-    content: Mapped[dict[str, Any]] = mapped_column(JSON, doc="Recommendation payload (weights, candidates, rationale)")
-    data_snapshot_id: Mapped[str | None] = mapped_column(ForeignKey("data_snapshots.id"), default=None)
+    content: Mapped[dict[str, Any]] = mapped_column(_json(), doc="Recommendation payload (weights, candidates, rationale)")
+    data_snapshot_id: Mapped[str | None] = mapped_column(ForeignKey("data_snapshots.id"), default=None, index=True)
     status: Mapped[str] = mapped_column(String(20), default=DecisionStatus.DRAFT, index=True)
     reviewer: Mapped[str | None] = mapped_column(String(128), default=None)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
     veto_reason: Mapped[str | None] = mapped_column(Text, default=None)
-    adjustment: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None, doc="Human modifications to the recommendation")
+    adjustment: Mapped[dict[str, Any] | None] = mapped_column(_json(), default=None, doc="Human modifications to the recommendation")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     run: Mapped[AgentRun | None] = relationship(back_populates="decisions")
@@ -421,10 +469,10 @@ class RecommendationTracking(Base):
     actual_return: Mapped[float | None] = mapped_column(Float, default=None, doc="Weighted portfolio return since decision")
     return_deviation: Mapped[float | None] = mapped_column(Float, default=None, doc="actual - expected")
     actual_max_drawdown: Mapped[float | None] = mapped_column(Float, default=None)
-    per_product: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None, doc="Per-product actual metrics")
+    per_product: Mapped[dict[str, Any] | None] = mapped_column(_json(), default=None, doc="Per-product actual metrics")
     status: Mapped[str] = mapped_column(String(20), default=TrackingStatus.NORMAL, index=True)
-    breach_reasons: Mapped[list[str] | None] = mapped_column(JSON, default=None)
-    triggered_task_id: Mapped[str | None] = mapped_column(ForeignKey("review_tasks.id"), default=None)
+    breach_reasons: Mapped[list[str] | None] = mapped_column(_json(), default=None)
+    triggered_task_id: Mapped[str | None] = mapped_column(ForeignKey("review_tasks.id"), default=None, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     decision: Mapped[DecisionRecord] = relationship(back_populates="tracking_records")
@@ -456,3 +504,29 @@ class ReviewTask(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     decision: Mapped[DecisionRecord | None] = relationship(back_populates="review_tasks")
+
+
+# ---------------------------------------------------------------------------
+# 8. Analysis History (research archive)
+# ---------------------------------------------------------------------------
+
+
+class AnalysisHistory(Base):
+    """A saved analysis session, previously only stored in browser localStorage.
+
+    Syncing to the backend enables cross-device access and prevents data loss
+    when the browser cache is cleared.
+    """
+
+    __tablename__ = "analysis_history"
+
+    id: Mapped[str] = mapped_column(String(20), primary_key=True, default=_uuid)
+    product_name: Mapped[str] = mapped_column(String(256), default="未命名产品")
+    frequency: Mapped[str] = mapped_column(String(20), doc="daily | weekly | monthly")
+    nav_count: Mapped[int] = mapped_column(Integer, default=0)
+    nav_text: Mapped[str] = mapped_column(Text, default="")
+    metrics: Mapped[dict[str, Any]] = mapped_column(_json(), doc="Performance metrics snapshot")
+    source_text: Mapped[str | None] = mapped_column(Text, default=None)
+    strategy_profile: Mapped[dict[str, Any] | None] = mapped_column(_json(), default=None)
+    ai_report: Mapped[dict[str, Any] | None] = mapped_column(_json(), default=None)
+    saved_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

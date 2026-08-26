@@ -21,6 +21,12 @@
 - 任何曲线、纵轴或横轴证据不足时，结果只作为候选，必须对照原图人工确认后才能进入研究。
 - 多产品材料先完成产品/曲线绑定；文件名或单个 OCR 标签不会自动决定产品归属。
 
+### 归因证据与模型边界
+
+- 保存 CTA 归因快照时，系统会同时冻结净值指纹、因子版本、已审核净值 ID、来源文件/页片段以及结论的支持证据和局限。
+- 报告中的因子 Beta、收益贡献、风险贡献和非线性预测增量均由确定性代码计算；它们描述统计关系，不等同于真实持仓、交易行为或管理人技能。
+- LLM 只可基于冻结的结构化证据包润色解释，不能计算、修改或审核净值，也不能把图片当作数值真相。只有人工明确要求解释图表语义时，才可提供单独裁剪的来源图片。
+
 ## 技术栈
 
 - 后端：Python、FastAPI、SQLAlchemy、pandas、NumPy、SciPy、statsmodels、scikit-learn、OpenCV
@@ -30,9 +36,9 @@
 ## 目录结构
 
 ```text
-backend/           FastAPI API、数据库模型、分析服务与测试
+backend/           FastAPI API、数据库模型与分析服务
 frontend/          React 研究界面
-scripts/           批量导入与工程验证脚本
+scripts/           批量导入脚本
 start.py           Windows 本地启动器
 启动.bat           双击启动入口
 ```
@@ -49,14 +55,6 @@ pip install -r requirements.txt
 
 cd ..\frontend
 npm install
-```
-
-需要运行测试时，再安装开发依赖：
-
-```powershell
-cd backend
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements-dev.txt
 ```
 
 ## 启动
@@ -98,21 +96,12 @@ $env:PADDLEOCR_API_TOKEN = "你的令牌"
 
 不要把令牌写入 README、前端配置或提交到 GitHub。
 
-## 验证
+## 本地检查
 
-运行项目验证入口：
-
-```powershell
-.\scripts\verify.ps1
-```
-
-也可以分别运行：
+前端构建检查：
 
 ```powershell
-cd backend
-.\.venv\Scripts\python.exe -m pytest
-
-cd ..\frontend
+cd frontend
 npm run build
 ```
 

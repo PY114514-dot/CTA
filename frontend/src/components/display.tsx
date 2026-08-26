@@ -84,6 +84,7 @@ export function ReportExtractionView({ report }: { report: MultiProductReportRes
           <span>
             披露累计 {percentage(item.cumulative_return)} · 年化 {percentage(item.annualized_return)} · 最大回撤{" "}
             {item.maximum_drawdown_disclosed === false ? "未披露" : percentage(item.maximum_drawdown)}
+            {item.sharpe_ratio != null && ` · 夏普 ${item.sharpe_ratio.toFixed(2)}`}
           </span>
           <div style={{ color: "#667085", fontSize: 12, marginTop: 3 }}>
             {item.start_date} 至 {item.end_date}；请在下方预览中按同序选择对应曲线校准。

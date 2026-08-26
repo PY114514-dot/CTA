@@ -6,9 +6,9 @@
 import React from "react";
 import { FONT_DISPLAY, FONT_MONO } from "../theme";
 
-/** Warm-toned calibration line colors, one per anchor. */
+/** Distinct calibration line colors, one per anchor. */
 export const ANCHOR_LINE_COLORS: Record<"start" | "end" | "top" | "bottom", string> = {
-  start: "#B8860B",
+  start: "#2563EB",
   end: "#A8503F",
   top: "#4C7A5C",
   bottom: "#4A6B8A",
@@ -64,8 +64,8 @@ export function StepSection({
 }
 
 /**
- * CubeMind-style square marking button: warm gray by default, burnished gold
- * when armed, tinted border with a check once the anchor is placed.
+ * Square marking button: muted by default, blue when armed, tinted border
+ * with a check once the anchor is placed.
  */
 export function AnchorMarkButton({
   anchor,

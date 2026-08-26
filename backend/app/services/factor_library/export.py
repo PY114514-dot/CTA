@@ -23,6 +23,7 @@ def _catalog_rows() -> list[dict]:
             "因子代码": f["name"],
             "因子名称": f["display_name"],
             "类别": f["category"],
+            "频率": f["frequency"],
             "说明": f["description"],
             "默认参数": str(f["params"]),
             "已缓存": "是" if f["cached"] else "否",

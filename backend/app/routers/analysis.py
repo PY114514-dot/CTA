@@ -93,15 +93,18 @@ def test_analysis_config() -> dict[str, object]:
     started = perf_counter()
     try:
         with httpx.Client(timeout=15.0) as client:
+            payload = {
+                "model": config.model,
+                "messages": [{"role": "user", "content": "Reply with OK."}],
+                "max_tokens": 128 if config.thinking_enabled else 4,
+                "temperature": 0,
+            }
+            if config.model.lower().startswith("deepseek-") and not config.thinking_enabled:
+                payload["thinking"] = {"type": "disabled"}
             response = client.post(
                 f"{config.api_base.rstrip('/')}/chat/completions",
                 headers={"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"},
-                json={
-                    "model": config.model,
-                    "messages": [{"role": "user", "content": "Reply with OK."}],
-                    "max_tokens": 4,
-                    "temperature": 0,
-                },
+                json=payload,
             )
             response.raise_for_status()
             content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -460,6 +463,8 @@ def run_full_analysis_report(request: ReportGenerateRequest) -> ReportGenerateRe
         external_factor_context=external_factor_context,
         market_reference_context=market_reference_context,
     )
+    if report.llm_error:
+        warnings.append(f"LLM 研究解读失败，已回退模板：{report.llm_error}")
 
     # Deep attribution is an independent evidence layer.  It is intentionally
     # not used to alter CODEX ranking or the existing OLS factor scores.
@@ -577,6 +582,8 @@ def get_analysis_config() -> LlmConfigResponse:
         provider=provider,
         model=config.model,
         api_base_configured=bool(config.api_base),
+        thinking_enabled=config.thinking_enabled,
+        max_tokens=config.max_tokens,
     )
 
 
@@ -588,11 +595,15 @@ def update_analysis_config(request: LlmConfigUpdateRequest) -> LlmConfigResponse
         api_key=request.api_key,
         model=request.model,
         enabled=bool(request.api_base and request.api_key),
+        thinking_enabled=request.thinking_enabled,
+        max_tokens=request.max_tokens,
     )
     set_report_config(new_config)
     persist_local_environment({
         "LLM_API_BASE": request.api_base,
         "LLM_API_KEY": request.api_key,
         "LLM_MODEL": request.model,
+        "LLM_THINKING_ENABLED": str(request.thinking_enabled).lower(),
+        "LLM_MAX_TOKENS": str(request.max_tokens),
     })
     return get_analysis_config()

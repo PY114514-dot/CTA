@@ -224,7 +224,7 @@ function FactorRiskContributionChart({
     .filter((row): row is { label: string; value: number } => typeof row.value === "number" && Number.isFinite(row.value));
   if (!rows.length) return null;
   const option = {
-    title: { text: "因子风险贡献", left: "center", textStyle: { fontSize: 14 } },
+    title: { text: "已解释风险内的因子占比", left: "center", textStyle: { fontSize: 14 } },
     tooltip: { trigger: "axis" as const, valueFormatter: (value: number) => `${fixedOrDash(value, 1)}%` },
     grid: { left: 90, right: 30, top: 42, bottom: 28 },
     xAxis: { type: "value" as const, axisLabel: { formatter: (value: number) => `${value.toFixed(0)}%` } },
@@ -279,23 +279,16 @@ function FactorRelationshipMatrix({
 
 type ExplainabilityPoint = {
   date: string;
-  product_index: number;
-  predicted_index: number;
-  residual: number;
   factor_contributions: Record<string, number>;
 };
 
 function FactorExplainabilityCharts({
   data,
-  productNav,
 }: {
   data?: { series: ExplainabilityPoint[]; factor_labels: Record<string, string>; description?: string };
-  productNav?: Array<{ date: string; normalized_nav: number | null }>;
 }): React.JSX.Element | null {
   if (!data?.series?.length) return null;
   const dates = data.series.map((point) => point.date);
-  const product = data.series.map((point) => point.product_index);
-  const predicted = data.series.map((point) => point.predicted_index);
   const contributionNames = Object.keys(data.factor_labels);
   const contributionSeries = contributionNames.map((name) => ({
     name: data.factor_labels[name] ?? name,
@@ -304,20 +297,8 @@ function FactorExplainabilityCharts({
     symbol: "none",
     smooth: true,
   }));
-  const curveOption = {
-    title: { text: "产品净值 vs 因子拟合曲线", left: "center", textStyle: { fontSize: 14 } },
-    tooltip: { trigger: "axis" as const },
-    legend: { bottom: 0, data: ["产品累计净值", "因子拟合净值"] },
-    grid: { left: 54, right: 24, top: 42, bottom: 48 },
-    xAxis: { type: "category" as const, data: dates, axisLabel: { hideOverlap: true, fontSize: 10 } },
-    yAxis: { type: "value" as const, scale: true },
-    series: [
-      { name: "产品累计净值", type: "line" as const, data: product, symbol: "none", lineStyle: { width: 2, color: "#1677ff" } },
-      { name: "因子拟合净值", type: "line" as const, data: predicted, symbol: "none", lineStyle: { width: 2, type: "dashed" as const, color: "#d97706" } },
-    ],
-  };
   const contributionOption = {
-    title: { text: "因子累计贡献（beta × 因子收益）", left: "center", textStyle: { fontSize: 14 } },
+    title: { text: "因子累计贡献（关联系数 × 因子收益）", left: "center", textStyle: { fontSize: 14 } },
     tooltip: { trigger: "axis" as const },
     legend: { bottom: 0, type: "scroll" as const },
     grid: { left: 54, right: 24, top: 42, bottom: 48 },
@@ -327,15 +308,7 @@ function FactorExplainabilityCharts({
   };
   return (
     <div style={{ marginTop: 18 }}>
-      <Row gutter={[12, 12]}>
-        <Col xs={24} lg={12}><ReactECharts option={curveOption} style={{ height: 300 }} /></Col>
-        <Col xs={24} lg={12}><ReactECharts option={contributionOption} style={{ height: 300 }} /></Col>
-      </Row>
-      {productNav?.length ? (
-        <Text type="secondary" style={{ display: "block", fontSize: 11, marginTop: 4 }}>
-          图中产品曲线使用与因子实际日期交集后的观测；原始净值曲线共 {productNav.length} 个点，避免把缺失日期误当成因子收益。
-        </Text>
-      ) : null}
+      <ReactECharts option={contributionOption} style={{ height: 300 }} />
       {data.description && <Text type="secondary" style={{ display: "block", fontSize: 11, marginTop: 4 }}>{data.description}</Text>}
     </div>
   );
@@ -352,7 +325,7 @@ function DeepAttributionSection({ data }: { data?: DeepAttributionResponse }): R
       <Alert
         type={diagnostics.reliability_label === "高" ? "success" : diagnostics.reliability_label === "不可识别" ? "warning" : "info"}
         showIcon
-        message={`可靠性：${diagnostics.reliability_label ?? "—"} · 资产大类候选：${asset.most_likely_label ?? "不可识别"}（${fixedOrDash(asset.confidence_pct, 1)}%）`}
+        message={`归因结论可信度：${diagnostics.reliability_label ?? "—"} · 计算稳定性：${diagnostics.statistical_stability_label ?? "—"} · 资产大类候选：${asset.most_likely_label ?? "不可识别"}（${fixedOrDash(asset.confidence_pct, 1)}%）`}
         description={data.disclaimer}
         style={{ marginBottom: 12 }}
       />
@@ -364,6 +337,9 @@ function DeepAttributionSection({ data }: { data?: DeepAttributionResponse }): R
       {sectorRows.length > 0 && (
         <>
           <Text strong style={{ display: "block", marginBottom: 6 }}>板块候选（不是实际仓位）</Text>
+          <Text type="secondary" style={{ display: "block", fontSize: 11, marginBottom: 8 }}>
+            相对候选权重由公开市场代理与产品收益的中位相关性（35%）、Elastic Net 标准化系数（25%）、时间切分非线性模型置换重要性（20%）和 Bootstrap 符号一致性（20%）合成后归一化；不是发生概率、仓位比例或收益归因。
+          </Text>
           <Table
             size="small"
             pagination={false}
@@ -371,7 +347,7 @@ function DeepAttributionSection({ data }: { data?: DeepAttributionResponse }): R
             dataSource={sectorRows}
             columns={[
               { title: "板块", dataIndex: "label" },
-              { title: "候选概率", dataIndex: "candidate_probability_pct", render: (value: number) => `${fixedOrDash(value, 1)}%` },
+              { title: "相对候选权重", dataIndex: "candidate_probability_pct", render: (value: number) => `${fixedOrDash(value, 1)}%` },
               { title: "方向", dataIndex: "direction" },
               { title: "稳定性", dataIndex: "stability_pct", render: (value: number) => `${fixedOrDash(value, 0)}%` },
               { title: "证据", dataIndex: "evidence", render: (values: string[]) => <Text type="secondary" ellipsis={{ tooltip: values.join("；") }}>{values[0] ?? "—"}</Text> },
@@ -398,10 +374,10 @@ function DeepAttributionSection({ data }: { data?: DeepAttributionResponse }): R
         </>
       )}
       {data.state_analysis.length > 0 && (
-        <Descriptions size="small" column={{ xs: 1, sm: 2 }} title="状态条件表现" style={{ marginTop: 12 }}>
+        <Descriptions size="small" column={{ xs: 1, sm: 2 }} title="商品 CTA 市场状态表现（探索）" style={{ marginTop: 12 }}>
           {data.state_analysis.map((state) => (
             <Descriptions.Item key={state.state} label={state.state}>
-              {state.periods} 期；产品平均收益 {fixedOrDash(state.product_mean_return * 100, 2)}%；正收益率 {fixedOrDash(state.product_positive_rate * 100, 1)}%
+              {state.periods} 期；平均收益 {fixedOrDash(state.product_mean_return * 100, 2)}%（较全样本 {state.relative_mean_return >= 0 ? "+" : ""}{fixedOrDash(state.relative_mean_return * 100, 2)}%）；正收益率 {fixedOrDash(state.product_positive_rate * 100, 1)}%
             </Descriptions.Item>
           ))}
         </Descriptions>
@@ -454,9 +430,13 @@ function PeerComparison({
     void (async () => {
       try {
         const exclusions: PeerExclusion[] = [];
-        const eligible = (await kbListProducts({ confirmation_status: "confirmed" }))
+        const eligible = (await kbListProducts({ limit: 1000 }))
           .filter((product: KbProduct) => product.standard_name !== productName)
           .filter((product: KbProduct) => {
+            if (product.research_workflow?.stage !== "research_ready") {
+              exclusions.push({ name: product.standard_name, reason: product.research_workflow?.blocking_reasons[0] ?? "产品尚不可研究" });
+              return false;
+            }
             if (product.reviewed_nav_count < 10) {
               exclusions.push({ name: product.standard_name, reason: "已复核净值不足 10 个" });
               return false;
@@ -726,6 +706,10 @@ export default function AnalysisPanel({ navPoints, frequency, productName, strat
   const externalFactors = result?.structured?.external_factors;
   const marketReference = result?.structured?.market_reference;
   const navProfile = result?.structured?.nav_profile;
+  const userConfirmation = classification?.details?.user_confirmation as {
+    confirmed?: boolean;
+    requested_type?: string;
+  } | undefined;
   const isExploratory = (navProfile?.point_count ?? 0) < 52;
   const factorLabels = useMemo(
     () => Object.fromEntries((factors?.factors ?? []).map((factor) => [factor.factor_name, factor.factor_label])),
@@ -789,7 +773,7 @@ export default function AnalysisPanel({ navPoints, frequency, productName, strat
             status="process"
             items={[
               { title: "策略分类", description: "相关性 + 滚动稳定性" },
-              { title: "风格参考", description: "历史 OLS 回归" },
+              { title: "风格参考", description: "历史回归分析" },
               { title: "品种推断", description: "LASSO 稀疏回归" },
               { title: "生成报告", description: llmConfig?.enabled ? "LLM 摘要" : "模板摘要" },
             ]}
@@ -833,7 +817,7 @@ export default function AnalysisPanel({ navPoints, frequency, productName, strat
               showIcon
               style={{ marginBottom: 16 }}
               message={`外部因子参考：截至 ${externalFactors.latest_as_of_date ?? "未知"} · ${externalFactors.verified ? "已核验" : "待核验"}`}
-              description={`覆盖 ${externalFactors.factor_count ?? 0} 个因子、${externalFactors.observation_count ?? 0} 条观测；${externalFactors.usable_for_regression ? "可用于回归" : "当前仅作为披露快照参考，未直接进入回归"}。`}
+              description={`覆盖 ${externalFactors.factor_count ?? 0} 个因子、${externalFactors.observation_count ?? 0} 条观测；${externalFactors.usable_for_regression ? "可用于回归" : "当前仅作为已保存的披露数据参考，未直接进入回归"}。`}
             />
           )}
           {externalFactors && !externalFactors.available && externalFactors.date_relation === "no_snapshot_on_or_before_product_end" && (
@@ -842,7 +826,7 @@ export default function AnalysisPanel({ navPoints, frequency, productName, strat
               showIcon
               style={{ marginBottom: 16 }}
               message="外部因子参考未对齐，已自动排除"
-              description={`产品截止日为 ${externalFactors.product_end ?? "未知"}；现有外部周报最早可用快照截至 ${externalFactors.latest_available_as_of_date ?? "未知"}，晚于该日期。请导入产品截止日前的周报后重新生成报告。`}
+              description={`产品截止日为 ${externalFactors.product_end ?? "未知"}；现有外部周报最早可用数据截至 ${externalFactors.latest_available_as_of_date ?? "未知"}，晚于该日期。请导入产品截止日前的周报后重新生成报告。`}
             />
           )}
           {marketReference?.available && (
@@ -865,7 +849,7 @@ export default function AnalysisPanel({ navPoints, frequency, productName, strat
                 <Descriptions.Item label="年化收益">{navProfile.annualized_return === null ? "—" : `${fixedOrDash(navProfile.annualized_return * 100, 2)}%`}</Descriptions.Item>
                 <Descriptions.Item label="年化波动">{navProfile.annualized_volatility === null ? "—" : `${fixedOrDash(navProfile.annualized_volatility * 100, 2)}%`}</Descriptions.Item>
               </Descriptions>
-              {isExploratory && <Alert type="warning" showIcon style={{ marginTop: 10 }} message={`当前只有 ${navProfile.point_count} 个${navProfile.frequency === "weekly" ? "周度" : ""}点：滚动回归、压力测试与同类分位仅作探索性参考`} description="通常建议至少 52 个周度观测、且与外部因子有不少于 40 个共同收益期后，再作较强的风格或配置判断。" />}
+              {isExploratory && <Alert type="warning" showIcon style={{ marginTop: 10 }} message={`当前只有 ${navProfile.point_count} 个${navProfile.frequency === "weekly" ? "周度" : ""}点：滚动回归、压力测试与同类分位仅作探索性参考`} />}
               <Text type="secondary" style={{ display: "block", fontSize: 12, marginTop: 8 }}>以上为净值序列直接计算；以下因子结果是历史统计代理，不代表真实持仓、未来收益或投资建议。</Text>
             </Card>
           )}
@@ -900,16 +884,17 @@ export default function AnalysisPanel({ navPoints, frequency, productName, strat
               <Descriptions column={{ xs: 1, sm: 3 }} size="small">
                 <Descriptions.Item label="策略类型">
                   <Tag color={classification.strategy_type === "commodity_cta" ? "blue" : classification.strategy_type === "equity_quant" ? "purple" : "default"}>
-                    {strategyTypeLabel(classification.strategy_type)}
+                    {userConfirmation?.confirmed ? `已确认：${strategyTypeLabel(classification.strategy_type)}` : strategyTypeLabel(classification.strategy_type)}
                   </Tag>
                 </Descriptions.Item>
-                <Descriptions.Item label="置信度">
+                <Descriptions.Item label="统计识别置信度">
                   <Progress percent={Math.round(classification.confidence_pct)} size="small" style={{ width: 120 }} />
                 </Descriptions.Item>
-                <Descriptions.Item label="置信标签">
-                  <Tag color={confidenceColor(classification.confidence_label)}>{classification.confidence_label}</Tag>
+                <Descriptions.Item label="统计结果">
+                  <Tag color={confidenceColor(classification.confidence_label)}>仅凭净值：{classification.confidence_label}</Tag>
                 </Descriptions.Item>
               </Descriptions>
+              {userConfirmation?.confirmed && <Text type="secondary" style={{ display: "block", marginTop: 8, fontSize: 12 }}>研究范围已按你的确认执行；统计识别置信度仅衡量净值与公开市场代理的关系，不会推翻该确认。</Text>}
               {classification.strategy_type === "insufficient_data" && (
                 <Alert
                   type="info"
@@ -1038,7 +1023,7 @@ export default function AnalysisPanel({ navPoints, frequency, productName, strat
                             {factors.collinearity.high_correlation_pairs.length > 0
                               ? `重叠较高的代理：${factors.collinearity.high_correlation_pairs.join("；")}`
                               : "条件数偏高，多个因子难以单独区分。"}
-                            滚动曲线使用岭回归（α={fixedOrDash(factors.collinearity.ridge_alpha, 1)}）稳定化；表内全样本 Beta 仍为 OLS 参考。
+                            分窗口曲线使用岭回归（参数 {fixedOrDash(factors.collinearity.ridge_alpha, 1)}）稳定化；表内全样本关联系数仍为普通回归参考。
                           </span>
                         ) : (
                           <span>当前代理之间未发现需要稳定化的强共线性；因子结果仍仅作风格参考。</span>
@@ -1077,9 +1062,9 @@ export default function AnalysisPanel({ navPoints, frequency, productName, strat
                       pagination={false}
                       columns={[
                         { title: "因子", dataIndex: "factor_label", width: 110 },
-                        { title: "Beta", dataIndex: "exposure_beta", width: 70, render: (v: number) => fixedOrDash(v, 3) },
+                        { title: "关联系数", dataIndex: "exposure_beta", width: 90, render: (v: number) => fixedOrDash(v, 3) },
                         {
-                          title: "下行 Beta",
+                          title: "下跌期关联系数",
                           width: 78,
                           render: (_: unknown, row: { factor_name: string }) => fixedOrDash(factorRiskProfile?.downside_betas[row.factor_name], 3),
                         },
@@ -1119,7 +1104,7 @@ export default function AnalysisPanel({ navPoints, frequency, productName, strat
                     <Text type="secondary">R² = {fixedOrDash(factors.r_squared, 3)}，Adj R² = {fixedOrDash(factors.adj_r_squared, 3)}</Text>
                   </div>
                   <Text type="secondary" style={{ display: "block", fontSize: 11, marginTop: 4, lineHeight: 1.5 }}>
-                    下行 Beta 只在该因子下跌期计算；风险贡献来自回归因子协方差矩阵，不代表实际持仓比例或未来收益。
+                    下跌期关联系数只在该因子下跌期计算；风险贡献来自因子之间的统计关系，不代表实际持仓比例或未来收益。
                   </Text>
                 </Col>
                 <Col xs={24} md={12}>
@@ -1128,7 +1113,6 @@ export default function AnalysisPanel({ navPoints, frequency, productName, strat
               </Row>
               <FactorExplainabilityCharts
                 data={result.charts_data.factor_explainability}
-                productNav={result.charts_data.product_nav_curve}
               />
               {factorRiskProfile && (
                 <>
@@ -1210,7 +1194,7 @@ export default function AnalysisPanel({ navPoints, frequency, productName, strat
               </Row>
               <Text type="secondary" style={{ display: "block", marginTop: 10, fontSize: 11 }}>
                 {classification?.strategy_type === "equity_quant"
-                  ? "柱状图是相关性、LASSO 系数和滚动入选率合成的候选评分；圆环图仅将各市场组的评分归一化为相对占比，不是实际持仓、方向或套保比例。"
+                  ? "柱状图是相关性、LASSO 系数和分窗口入选率合成的候选评分；圆环图仅将各市场组的评分归一化为相对占比，不是实际持仓、方向或套保比例。"
                   : "品种候选评分不代表实际期货持仓、方向或仓位比例。"}
               </Text>
             </Card>

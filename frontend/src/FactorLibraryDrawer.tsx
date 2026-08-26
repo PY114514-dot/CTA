@@ -7,7 +7,6 @@ import {
   Drawer,
   Modal,
   Progress,
-  Select,
   Space,
   Spin,
   Table,
@@ -24,22 +23,18 @@ import {
   getBuildJob,
   getFactorDetail,
   getFactorLibraryStatus,
-  getFactorPerformance,
   getSectorBreakdown,
   listFactors,
   startFactorBuild,
   type BuildJobStatus,
   type FactorDetail,
   type FactorMetaItem,
-  type FactorPerformanceItem,
   type FactorSectorBreakdown,
-  type RiskOverlayMeta,
   type SectorBreakdownResponse,
 } from "./api";
 import { FONT_DISPLAY } from "./theme";
 import ExternalFactorLibraryPanel from "./ExternalFactorLibraryPanel";
 import { SectionTitle } from "./ui/Section";
-import { pct, SignedValue } from "./ui/SignedValue";
 
 const { Paragraph, Text } = Typography;
 const { RangePicker } = DatePicker;
@@ -83,12 +78,52 @@ interface FactorRow {
   name: string;
   display_name: string;
   category: string;
+  frequency: FactorMetaItem["frequency"];
   description: string;
   rows: number | null;
   start: string | null;
   end: string | null;
   built_at: string | null;
   cached: boolean;
+}
+
+function SectorHeatmap({ data, selectedName, onSelect }: {
+  data: FactorSectorBreakdown[];
+  selectedName: string | null;
+  onSelect: (name: string) => void;
+}): React.JSX.Element {
+  const sectors = [...new Map(data.flatMap((factor) => factor.sectors.map((sector) => [sector.sector, sector]))).values()];
+  const maxMagnitude = Math.max(...data.flatMap((factor) => factor.sectors.map((sector) => Math.abs(sector.contribution))), 0.01);
+  const selected = data.find((factor) => factor.factor_name === selectedName) ?? data[0];
+  const cellStyle = (value: number): React.CSSProperties => {
+    const alpha = 0.10 + Math.min(Math.abs(value) / maxMagnitude, 1) * 0.48;
+    return {
+      background: value > 0 ? `rgba(82, 196, 26, ${alpha})` : value < 0 ? `rgba(245, 34, 45, ${alpha})` : "var(--serif-muted)",
+      color: value > 0 ? "#237804" : value < 0 ? "#cf1322" : "var(--serif-muted-foreground)",
+    };
+  };
+  return <>
+    <div style={{ overflowX: "auto", marginTop: 14 }}>
+      <div style={{ minWidth: 600, display: "grid", gridTemplateColumns: `minmax(160px, 1.6fr) repeat(${sectors.length}, minmax(82px, 1fr))`, gap: 4 }}>
+        <div style={{ padding: "7px 10px", fontSize: 12, color: "var(--serif-muted-foreground)" }}>因子 / 板块</div>
+        {sectors.map((sector) => <div key={sector.sector} style={{ padding: "7px 4px", textAlign: "center", fontSize: 12, color: "var(--serif-muted-foreground)" }}>{sector.display_sector}</div>)}
+        {data.map((factor) => {
+          const values = new Map(factor.sectors.map((sector) => [sector.sector, sector.contribution]));
+          const active = factor.factor_name === selected?.factor_name;
+          return <React.Fragment key={factor.factor_name}>
+            <button type="button" onClick={() => onSelect(factor.factor_name)} style={{ cursor: "pointer", border: active ? "1px solid var(--serif-foreground)" : "1px solid var(--serif-border)", borderRadius: 5, background: active ? "var(--serif-muted)" : "var(--serif-card)", padding: "8px 10px", textAlign: "left", font: "inherit" }}>
+              <Text strong>{factor.display_name}</Text><br /><span style={{ fontSize: 12, color: factor.period_return >= 0 ? "#389e0d" : "#cf1322" }}>{factor.period_return >= 0 ? "+" : ""}{factor.period_return.toFixed(2)}%</span>
+            </button>
+            {sectors.map((sector) => {
+              const value = values.get(sector.sector) ?? 0;
+              return <button type="button" key={sector.sector} onClick={() => onSelect(factor.factor_name)} style={{ ...cellStyle(value), cursor: "pointer", border: active ? "1px solid var(--serif-foreground)" : "1px solid transparent", borderRadius: 5, padding: "8px 4px", fontVariantNumeric: "tabular-nums" }}>{value >= 0 ? "+" : ""}{value.toFixed(2)}%</button>;
+            })}
+          </React.Fragment>;
+        })}
+      </div>
+    </div>
+    {selected && <Paragraph type="secondary" style={{ fontSize: 12, margin: "10px 0 0" }}>{selected.prose}</Paragraph>}
+  </>;
 }
 
 // ---------------------------------------------------------------------------
@@ -105,9 +140,6 @@ export default function FactorLibraryDrawer({ open, onClose }: FactorLibraryDraw
   const [dataError, setDataError] = useState<string | null>(null);
   const [factors, setFactors] = useState<FactorMetaItem[]>([]);
   const [status, setStatus] = useState<FactorLibraryStatus | null>(null);
-  const [performance, setPerformance] = useState<FactorPerformanceItem[]>([]);
-  const [riskProfile, setRiskProfile] = useState<RiskOverlayMeta["profile"]>("baseline");
-  const [riskOverlay, setRiskOverlay] = useState<RiskOverlayMeta | null>(null);
   const [dateRange, setDateRange] = useState<[Dayjs, Dayjs]>([dayjs("2020-01-01"), dayjs()]);
   const [useCache, setUseCache] = useState(true);
 
@@ -127,6 +159,7 @@ export default function FactorLibraryDrawer({ open, onClose }: FactorLibraryDraw
   const [sectorLoading, setSectorLoading] = useState(false);
   const [sectorError, setSectorError] = useState<string | null>(null);
   const [sectorData, setSectorData] = useState<SectorBreakdownResponse | null>(null);
+  const [selectedSectorFactor, setSelectedSectorFactor] = useState<string | null>(null);
 
   const jobRunning = job?.status === "running";
 
@@ -135,15 +168,13 @@ export default function FactorLibraryDrawer({ open, onClose }: FactorLibraryDraw
   const refreshData = useCallback(async (): Promise<void> => {
     setDataError(null);
     try {
-      const [f, s, p] = await Promise.all([listFactors(), getFactorLibraryStatus(), getFactorPerformance(riskProfile)]);
+      const [f, s] = await Promise.all([listFactors(), getFactorLibraryStatus()]);
       setFactors(f.factors);
       setStatus(s);
-      setPerformance(p.performance);
-      setRiskOverlay(p.risk_overlay);
     } catch (err) {
       setDataError(err instanceof Error ? err.message : String(err));
     }
-  }, [riskProfile]);
+  }, []);
 
   useEffect(() => {
     if (open) {
@@ -179,6 +210,7 @@ export default function FactorLibraryDrawer({ open, onClose }: FactorLibraryDraw
         sectorRange[1].format("YYYY-MM-DD"),
       );
       setSectorData(result);
+      setSelectedSectorFactor(result.factors[0]?.factor_name ?? null);
     } catch (err) {
       setSectorError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -273,6 +305,7 @@ export default function FactorLibraryDrawer({ open, onClose }: FactorLibraryDraw
           name: f.name,
           display_name: f.display_name,
           category: f.category,
+          frequency: f.frequency,
           description: f.description,
           rows: info?.rows ?? null,
           start: info?.start ?? null,
@@ -303,7 +336,7 @@ export default function FactorLibraryDrawer({ open, onClose }: FactorLibraryDraw
       dataIndex: "display_name",
       key: "display_name",
       render: (_: unknown, row: FactorRow) => (
-        <Tooltip title={`${row.description} · 点击查看公式与代码`}>
+        <Tooltip title={row.description}>
           <div
             onClick={() => void openDetail(row.name)}
             style={{ cursor: "pointer" }}
@@ -332,6 +365,13 @@ export default function FactorLibraryDrawer({ open, onClose }: FactorLibraryDraw
       key: "category",
       width: 72,
       render: (v: string) => <Tag>{v}</Tag>,
+    },
+    {
+      title: "频率",
+      dataIndex: "frequency",
+      key: "frequency",
+      width: 66,
+      render: (v: FactorMetaItem["frequency"]) => <Tag>{v === "weekly" ? "周频" : v === "monthly" ? "月频" : "日频"}</Tag>,
     },
     {
       title: "行数",
@@ -372,64 +412,6 @@ export default function FactorLibraryDrawer({ open, onClose }: FactorLibraryDraw
       width: 72,
       render: (_: unknown, row: FactorRow) =>
         row.cached ? <Tag color="green">已缓存</Tag> : <Tag color="default">未构建</Tag>,
-    },
-  ];
-
-  const perfColumns: TableProps<FactorPerformanceItem>["columns"] = [
-    {
-      title: "因子",
-      dataIndex: "display_name",
-      key: "display_name",
-      render: (v: string) => <span style={{ fontWeight: 600 }}>{v}</span>,
-    },
-    {
-      title: "年化收益",
-      dataIndex: "annualized_return",
-      key: "annualized_return",
-      align: "right",
-      render: (v: number) => <SignedValue value={v} format={pct} />,
-    },
-    {
-      title: "年化波动",
-      dataIndex: "annualized_vol",
-      key: "annualized_vol",
-      align: "right",
-      render: (v: number) => <span style={{ fontVariantNumeric: "tabular-nums" }}>{pct(v)}</span>,
-    },
-    {
-      title: "夏普",
-      dataIndex: "sharpe",
-      key: "sharpe",
-      align: "right",
-      render: (v: number) => <SignedValue value={v} format={(x) => x.toFixed(2)} />,
-    },
-    {
-      title: "最大回撤",
-      dataIndex: "max_drawdown",
-      key: "max_drawdown",
-      align: "right",
-      render: (v: number) => <SignedValue value={v} format={pct} />,
-    },
-    {
-      title: "胜率",
-      dataIndex: "win_rate",
-      key: "win_rate",
-      align: "right",
-      render: (v: number) => <span style={{ fontVariantNumeric: "tabular-nums" }}>{pct(v)}</span>,
-    },
-    {
-      title: "盈亏比",
-      dataIndex: "payoff_ratio",
-      key: "payoff_ratio",
-      align: "right",
-      render: (v: number) => <span style={{ fontVariantNumeric: "tabular-nums" }}>{v.toFixed(2)}</span>,
-    },
-    {
-      title: "最差月",
-      dataIndex: "worst_month",
-      key: "worst_month",
-      align: "right",
-      render: (v: number) => <SignedValue value={v} format={pct} />,
     },
   ];
 
@@ -506,7 +488,7 @@ export default function FactorLibraryDrawer({ open, onClose }: FactorLibraryDraw
           </Button>
         </div>
         <Paragraph type="secondary" style={{ fontSize: 12, marginTop: 8, marginBottom: 0 }}>
-          构建全部 10 个因子（趋势、量价相关性、截面动量、基差 Carry、盘面利润、短期动量、偏度、短期反转、仓单、库存），视数据源情况约需 1–5 分钟。
+          构建所有已注册因子（当前 {factors.length || "加载中"} 个）；南华商品指数直接读取本地周度数据，其余因子视数据源情况约需 1–5 分钟。
         </Paragraph>
 
         {job && (
@@ -604,45 +586,8 @@ export default function FactorLibraryDrawer({ open, onClose }: FactorLibraryDraw
         locale={{ emptyText: "暂无已注册因子" }}
       />
 
-      {/* Factor performance ------------------------------------------------------------ */}
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
-        <SectionTitle>因子表现概览</SectionTitle>
-        <Select
-          value={riskProfile}
-          style={{ width: 210 }}
-          onChange={(value: RiskOverlayMeta["profile"]) => setRiskProfile(value)}
-          options={[
-            { value: "baseline", label: "基准因子（归因口径）" },
-            { value: "vol_target", label: "波动率目标（10%）" },
-            { value: "drawdown_control", label: "波动率目标 + 回撤降仓" },
-          ]}
-        />
-      </div>
-      {riskOverlay && (
-        <Alert
-          type={riskProfile === "baseline" ? "info" : "warning"}
-          showIcon
-          style={{ marginBottom: 12 }}
-          message={riskOverlay.display_name}
-          description={`${riskOverlay.description} 产品净值归因始终使用“基准因子”，不会使用此处的风控覆盖收益。`}
-        />
-      )}
-      {performance.length > 0 ? (
-        <Table<FactorPerformanceItem>
-          columns={perfColumns}
-          dataSource={performance.map((p) => ({ ...p, key: p.name }))}
-          size="small"
-          pagination={false}
-          loading={loading}
-        />
-      ) : (
-        <Paragraph type="secondary" style={{ fontSize: 12 }}>
-          尚无已构建的因子缓存，请先执行构建。
-        </Paragraph>
-      )}
-
       {/* Sector breakdown (板块盈亏归因) ------------------------------------------------ */}
-      <SectionTitle>板块盈亏归因</SectionTitle>
+      <SectionTitle>因子 × 板块表现</SectionTitle>
       <div
         style={{
           padding: "12px",
@@ -663,62 +608,15 @@ export default function FactorLibraryDrawer({ open, onClose }: FactorLibraryDraw
             分析板块盈亏
           </Button>
         </div>
-        <Paragraph type="secondary" style={{ fontSize: 12, marginTop: 8, marginBottom: 0 }}>
-          基于因子贡献矩阵，按板块（黑色 / 有色 / 贵金属 / 能化 / 农产品）聚合区间盈亏。需先构建因子。
-        </Paragraph>
-
         {sectorError && (
           <Alert type="error" showIcon closable message={sectorError} style={{ marginTop: 10 }} onClose={() => setSectorError(null)} />
         )}
 
         {sectorData && sectorData.factors.length === 0 && !sectorError && (
-          <Alert type="info" showIcon message="该区间内无可用贡献数据，请先构建因子或调整日期范围。" style={{ marginTop: 10 }} />
+          <Alert type="info" showIcon message="该区间内无可用贡献数据" style={{ marginTop: 10 }} />
         )}
 
-        {sectorData && sectorData.factors.length > 0 && (
-          <div style={{ marginTop: 14 }}>
-            {sectorData.factors.map((f: FactorSectorBreakdown) => (
-              <div
-                key={f.factor_name}
-                style={{
-                  marginBottom: 14,
-                  padding: "10px 12px",
-                  border: "1px solid var(--serif-border)",
-                  borderRadius: 6,
-                  background: "var(--serif-background)",
-                }}
-              >
-                <div style={{ marginBottom: 6 }}>
-                  <Text strong style={{ color: "var(--serif-foreground)" }}>{f.display_name}</Text>
-                  <Text
-                    style={{
-                      marginLeft: 10,
-                      fontVariantNumeric: "tabular-nums",
-                      color: f.period_return >= 0 ? "#389e0d" : "#cf1322",
-                      fontWeight: 600,
-                    }}
-                  >
-                    {f.period_return >= 0 ? "+" : ""}{f.period_return.toFixed(2)}%
-                  </Text>
-                </div>
-                <Paragraph style={{ fontSize: 13, marginBottom: 8, color: "var(--serif-foreground)" }}>
-                  {f.prose}
-                </Paragraph>
-                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                  {f.sectors.map((s) => (
-                    <Tag
-                      key={s.sector}
-                      color={s.direction === "盈利" ? "green" : s.direction === "亏损" ? "red" : "default"}
-                      style={{ fontVariantNumeric: "tabular-nums" }}
-                    >
-                      {s.display_sector} {s.contribution >= 0 ? "+" : ""}{s.contribution.toFixed(2)}%
-                    </Tag>
-                  ))}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
+        {sectorData && sectorData.factors.length > 0 && <SectorHeatmap data={sectorData.factors} selectedName={selectedSectorFactor} onSelect={setSelectedSectorFactor} />}
       </div>
 
       <SectionTitle>外部 CTA 因子库</SectionTitle>
@@ -733,7 +631,7 @@ export default function FactorLibraryDrawer({ open, onClose }: FactorLibraryDraw
           color: "var(--serif-muted-foreground)",
         }}
       >
-        因子收益序列缓存于 <Text code>data/factors/</Text>，构建完成后可在「定量因子归因」中直接使用。
+        因子收益序列缓存于 <Text code>data/factors/</Text>。
       </div>
 
       {/* Factor detail dialog (公式与代码) ----------------------------------------- */}
