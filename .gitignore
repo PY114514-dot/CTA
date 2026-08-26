@@ -14,6 +14,32 @@ dist/
 data/
 .env
 
+# All local market data, uploaded materials and generated data artifacts
+uploads/
+raw/
+datasets/
+*.csv
+*.tsv
+*.xls
+*.xlsx
+*.parquet
+*.feather
+*.jsonl
+*.db
+
+# Original research materials imported through the application
+*.pdf
+*.doc
+*.docx
+*.ppt
+*.pptx
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.tif
+*.tiff
+
 # Machine-generated or accidental local directories
 %SystemDrive%/
 .codex/
